@@ -25,6 +25,8 @@ const overrideSchema = new mongoose.Schema(
     room: { type: String, default: null },
     /** Only meaningful for extra_class declarations: 'lecture' (make-up class) or 'ct' (declared class test). */
     classType: { type: String, enum: ['lecture', 'ct'], default: 'lecture' },
+    /** Shared id across every section copy of a batch-wide declaration (e.g. a CT). */
+    groupId: { type: String, default: null, index: true },
     routineEntryId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'RoutineEntry',

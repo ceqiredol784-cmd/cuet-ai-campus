@@ -59,6 +59,7 @@ router.post(
 
     const attachmentUrls = files.map((file) => ({
       url: `${req.protocol}://${req.get('host')}/uploads/updates/${file.filename}`,
+      name: file.originalname,
     }));
     const attachments =
       Array.isArray(payload.attachments) && payload.attachments.length > 0

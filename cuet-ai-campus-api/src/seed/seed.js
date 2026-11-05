@@ -20,8 +20,6 @@ import {
 import { pathToFileURL } from 'node:url';
 import { env } from '../config/env.js';
 import bcrypt from 'bcryptjs';
-import { permissionsForRoles } from '../constants.js';
-import { logAudit } from '../services/audit.js';
 
 /**
  * The only login accounts this seed creates — one per role, for manual testing.
@@ -29,6 +27,7 @@ import { logAudit } from '../services/audit.js';
  *
  *   u2204001@student.cuet.ac.bd  Demo Student      Section A   (student)
  *   u2204002@student.cuet.ac.bd  Demo CR           Section A   (student + cr)
+ *   u2204003@student.cuet.ac.bd  Demo Student B    Section B   (student)
  *   coordinator@cuet.ac.bd       Demo Coordinator  CSE dept    (coordinator)
  */
 const DEMO_ACCOUNTS = [
@@ -45,6 +44,13 @@ const DEMO_ACCOUNTS = [
     studentId: '2204002',
     section: 'A',
     roles: ['student', 'cr'],
+  },
+  {
+    email: 'u2204003@student.cuet.ac.bd',
+    name: 'Demo Student B',
+    studentId: '2204003',
+    section: 'B',
+    roles: ['student'],
   },
   {
     email: 'coordinator@cuet.ac.bd',
@@ -77,7 +83,6 @@ const COURSES = [
   { code: 'CSE-345', title: 'Artificial Intelligence', credits: 3 },
   { code: 'CSE-347', title: 'Introduction to Mathematical Programming', credits: 3 },
   { code: 'CSE-355', title: 'Software Engineering', credits: 3 },
-  { code: 'CT', title: 'Class Test', credits: 0 },
   { code: 'CSE-300/CSE-302', title: 'S/W Development Project + Technical Writing (Sessional)', credits: 1.5 },
   { code: 'CSE-356/CSE-300', title: 'Software Engineering + S/W Project (Sessional)', credits: 1.5 },
   { code: 'CSE-346 A1', title: 'Artificial Intelligence (Sessional) — Group A1', credits: 1.5 },
@@ -274,7 +279,6 @@ export async function seedDatabase({ clear = true } = {}) {
   // ---------- Routine entries ----------
   const routineSpecs = {
     A: [
-      { day: 'Sunday', period: 1, classType: 'ct', course: 'CT', teacher: null, room: 'Room 3403' },
       { day: 'Sunday', period: 2, classType: 'lecture', course: 'CSE-321', teacher: 't-tista', room: 'Room 3403' },
       { day: 'Sunday', period: 3, classType: 'lecture', course: 'CSE-347', teacher: 't-annesha', room: 'Room 3403' },
       { day: 'Sunday', period: 4, classType: 'lab', course: 'CSE-300/CSE-302', teacher: 't-tista', room: 'Network Lab (5th Fl)' },
@@ -289,7 +293,6 @@ export async function seedDatabase({ clear = true } = {}) {
       { day: 'Monday', period: 4, classType: 'lecture', course: 'CSE-345', teacher: 't-afroza', room: 'Room 3403' },
       { day: 'Monday', period: 5, classType: 'lecture', course: 'CSE-355', teacher: 't-kowsar', room: 'Room 3403' },
       { day: 'Monday', period: 6, classType: 'lecture', course: 'CSE-311', teacher: 't-rashadur', room: 'Room 3403' },
-      { day: 'Tuesday', period: 1, classType: 'ct', course: 'CT', teacher: null, room: 'Room 3403' },
       { day: 'Tuesday', period: 2, classType: 'lecture', course: 'CSE-347', teacher: 't-annesha', room: 'Room 3403' },
       { day: 'Tuesday', period: 4, classType: 'lecture', course: 'CSE-311', teacher: 't-rashadur', room: 'Room 3403' },
       { day: 'Tuesday', period: 5, classType: 'lecture', course: 'CSE-355', teacher: 't-kowsar', room: 'Room 3403' },
@@ -297,7 +300,6 @@ export async function seedDatabase({ clear = true } = {}) {
       { day: 'Tuesday', period: 7, classType: 'lab', course: 'CSE-312 A1', teacher: 't-rashadur', room: 'Network Lab (5th Fl)' },
       { day: 'Tuesday', period: 8, classType: 'lab', course: 'CSE-312 A1', teacher: 't-rashadur', room: 'Network Lab (5th Fl)' },
       { day: 'Tuesday', period: 9, classType: 'lab', course: 'CSE-312 A1', teacher: 't-rashadur', room: 'Network Lab (5th Fl)' },
-      { day: 'Wednesday', period: 1, classType: 'ct', course: 'CT', teacher: null, room: 'Room 3403' },
       { day: 'Wednesday', period: 3, classType: 'lecture', course: 'CSE-311', teacher: 't-rashadur', room: 'Room 3403' },
       { day: 'Wednesday', period: 4, classType: 'lecture', course: 'CSE-345', teacher: 't-afroza', room: 'Room 3403' },
       { day: 'Wednesday', period: 5, classType: 'lecture', course: 'CSE-355', teacher: 't-kowsar', room: 'Room 3403' },
@@ -305,7 +307,6 @@ export async function seedDatabase({ clear = true } = {}) {
       { day: 'Wednesday', period: 7, classType: 'lab', course: 'CSE-312 A2', teacher: 't-rashadur', room: 'Network Lab (5th Fl)' },
       { day: 'Wednesday', period: 8, classType: 'lab', course: 'CSE-312 A2', teacher: 't-rashadur', room: 'Network Lab (5th Fl)' },
       { day: 'Wednesday', period: 9, classType: 'lab', course: 'CSE-312 A2', teacher: 't-rashadur', room: 'Network Lab (5th Fl)' },
-      { day: 'Thursday', period: 1, classType: 'ct', course: 'CT', teacher: null, room: 'Room 3403' },
       { day: 'Thursday', period: 2, classType: 'lecture', course: 'CSE-345', teacher: 't-afroza', room: 'Room 3403' },
       { day: 'Thursday', period: 3, classType: 'lecture', course: 'CSE-321', teacher: 't-tista', room: 'Room 3403' },
       { day: 'Thursday', period: 4, classType: 'lab', course: 'CSE-356-A', teacher: 't-refaj', room: 'Compiler Lab (5th Fl)' },
@@ -313,7 +314,6 @@ export async function seedDatabase({ clear = true } = {}) {
       { day: 'Thursday', period: 6, classType: 'lab', course: 'CSE-356-A', teacher: 't-refaj', room: 'Compiler Lab (5th Fl)' },
     ],
     B: [
-      { day: 'Sunday', period: 1, classType: 'ct', course: 'CT', teacher: null, room: 'Room 3305' },
       { day: 'Sunday', period: 2, classType: 'lecture', course: 'CSE-347', teacher: 't-annesha', room: 'Room 3305' },
       { day: 'Sunday', period: 3, classType: 'lecture', course: 'CSE-321', teacher: 't-tista', room: 'Room 3305' },
       { day: 'Sunday', period: 4, classType: 'lab', course: 'CSE-346 B1', teacher: 't-ayesha', room: 'Multimedia Lab (5th Fl)' },
@@ -322,11 +322,9 @@ export async function seedDatabase({ clear = true } = {}) {
       { day: 'Sunday', period: 7, classType: 'lecture', course: 'CSE-302', teacher: 't-arefin', room: 'Room 3305' },
       { day: 'Sunday', period: 8, classType: 'lecture', course: 'CSE-302', teacher: 't-arefin', room: 'Room 3305' },
       { day: 'Sunday', period: 9, classType: 'lecture', course: 'CSE-302', teacher: 't-arefin', room: 'Room 3305' },
-      { day: 'Monday', period: 1, classType: 'ct', course: 'CT', teacher: null, room: 'Room 3305' },
       { day: 'Monday', period: 4, classType: 'lecture', course: 'CSE-311', teacher: 't-rashadur', room: 'Room 3305' },
       { day: 'Monday', period: 5, classType: 'lecture', course: 'CSE-345', teacher: 't-afroza', room: 'Room 3305' },
       { day: 'Monday', period: 6, classType: 'lecture', course: 'CSE-355', teacher: 't-kowsar', room: 'Room 3305' },
-      { day: 'Tuesday', period: 1, classType: 'ct', course: 'CT', teacher: null, room: 'Room 3305' },
       { day: 'Tuesday', period: 3, classType: 'lecture', course: 'CSE-347', teacher: 't-annesha', room: 'Room 3305' },
       { day: 'Tuesday', period: 4, classType: 'lecture', course: 'CSE-321', teacher: 't-tista', room: 'Room 3305' },
       { day: 'Tuesday', period: 5, classType: 'lecture', course: 'CSE-311', teacher: 't-rashadur', room: 'Room 3305' },
@@ -334,7 +332,6 @@ export async function seedDatabase({ clear = true } = {}) {
       { day: 'Tuesday', period: 7, classType: 'lab', course: 'CSE-356/CSE-300', teacher: 't-refaj', room: 'Multimedia Lab (5th Fl)' },
       { day: 'Tuesday', period: 8, classType: 'lab', course: 'CSE-356/CSE-300', teacher: 't-refaj', room: 'Multimedia Lab (5th Fl)' },
       { day: 'Tuesday', period: 9, classType: 'lab', course: 'CSE-356/CSE-300', teacher: 't-refaj', room: 'Multimedia Lab (5th Fl)' },
-      { day: 'Wednesday', period: 1, classType: 'ct', course: 'CT', teacher: null, room: 'Room 3305' },
       { day: 'Wednesday', period: 2, classType: 'lecture', course: 'CSE-311', teacher: 't-rashadur', room: 'Room 3305' },
       { day: 'Wednesday', period: 4, classType: 'lecture', course: 'CSE-347', teacher: 't-maisha', room: 'Room 3305' },
       { day: 'Wednesday', period: 5, classType: 'lecture', course: 'CSE-345', teacher: 't-afroza', room: 'Room 3305' },
@@ -342,7 +339,6 @@ export async function seedDatabase({ clear = true } = {}) {
       { day: 'Wednesday', period: 7, classType: 'lab', course: 'CSE-346 B2', teacher: 't-ayesha', room: 'Multimedia Lab (5th Fl)' },
       { day: 'Wednesday', period: 8, classType: 'lab', course: 'CSE-346 B2', teacher: 't-ayesha', room: 'Multimedia Lab (5th Fl)' },
       { day: 'Wednesday', period: 9, classType: 'lab', course: 'CSE-346 B2', teacher: 't-ayesha', room: 'Multimedia Lab (5th Fl)' },
-      { day: 'Thursday', period: 1, classType: 'ct', course: 'CT', teacher: null, room: 'Room 3305' },
       { day: 'Thursday', period: 2, classType: 'lecture', course: 'CSE-321', teacher: 't-tista', room: 'Room 3305' },
       { day: 'Thursday', period: 3, classType: 'lecture', course: 'CSE-345', teacher: 't-afroza', room: 'Room 3305' },
       { day: 'Thursday', period: 4, classType: 'lab', course: 'CSE-312 B2', teacher: 't-rashadur', room: 'Network Lab (5th Fl)' },

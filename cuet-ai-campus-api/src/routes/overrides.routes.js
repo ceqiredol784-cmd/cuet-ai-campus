@@ -1,12 +1,14 @@
 import express from 'express';
 import mongoose from 'mongoose';
+import { randomUUID } from 'node:crypto';
 import { protect, requireCr } from '../middleware/auth.js';
-import { ScheduleOverride, RoutineEntry, Update } from '../models/index.js';
+import { ScheduleOverride, RoutineEntry, Section, Update } from '../models/index.js';
 import { asyncHandler, sendData } from '../utils/http.js';
 import { AppError } from '../utils/http.js';
-import { isValidTime, normalizeDate, dayNameFor } from '../utils/dates.js';
+import { isValidTime, normalizeDate } from '../utils/dates.js';
 import { logAudit } from '../services/audit.js';
 import { idOf } from '../services/access.js';
+import { departmentCodeForBatch } from '../services/updates.js';
 import { overridePopulate } from '../services/routineSerializer.js';
 
 const router = express.Router();
@@ -111,6 +113,53 @@ async function createLinkedUpdate(override, user) {
   });
 }
 
+/** Batch-scoped feed mirror for a change applied to a batch-shared CT. */
+async function createBatchLinkedUpdate(override, user, groupCopy) {
+  const feed = overrideFeedContent(override);
+  const section = await Section.findById(groupCopy.sectionId);
+  const batchId = idOf(section?.batchId) || idOf(user.batchId);
+  const departmentCode = (await departmentCodeForBatch(batchId)) || null;
+  return Update.create({
+    authorId: user._id,
+    sectionId: null,
+    batchId: batchId || null,
+    courseId: override.courseId?._id || override.courseId || null,
+    type: feed.type,
+    title: feed.title,
+    description: feed.description,
+    priority: feed.priority,
+    scope: 'batch',
+    departmentCode,
+    status: 'approved',
+    sourceOverrideId: override._id,
+  });
+}
+
+/**
+ * Build the per-section copy of a change (cancel / room / time) that targets a
+ * batch-shared CT so every section sees the same shifted or cancelled slot.
+ */
+function changeOverrideForCopy(basePayload, body, type, copy, groupId) {
+  const originalValues = {
+    startTime: copy.startTime,
+    endTime: copy.endTime,
+    room: copy.room || null,
+  };
+  return new ScheduleOverride({
+    ...basePayload,
+    sectionId: copy.sectionId,
+    specificDate: copy.specificDate,
+    routineEntryId: copy._id,
+    originalValues,
+    startTime:
+      type === 'time_change' ? body.startTime || originalValues.startTime : originalValues.startTime,
+    endTime:
+      type === 'time_change' ? body.endTime || originalValues.endTime : originalValues.endTime,
+    room: type === 'room_change' ? body.room : originalValues.room,
+    groupId,
+  });
+}
+
 router.get(
   '/',
   asyncHandler(async (req, res) => {
@@ -152,16 +201,42 @@ router.post(
     };
 
     let override;
+    // Per-section copies of a change applied to a batch-shared CT.
+    let siblingsAdditional = [];
 
     if (type === 'auto_day_off') {
       const date = normalizeDate(body.date);
       if (!date) throw new AppError(400, 'A valid date (YYYY-MM-DD) is required');
+      const groupId = randomUUID();
       override = new ScheduleOverride({
         ...basePayload,
         specificDate: date,
         startDate: date,
         endDate: date,
+        groupId,
       });
+
+      // A CR day-off declaration is an academic day-off for the whole batch,
+      // not a section-only class cancellation. Copy it to every section so
+      // both section calendars resolve the same day status.
+      const ownSection = await Section.findById(sectionId).select('batchId');
+      const siblingSections = ownSection?.batchId
+        ? await Section.find({
+            batchId: ownSection.batchId,
+            _id: { $ne: sectionId },
+          }).select('_id')
+        : [];
+      siblingsAdditional = siblingSections.map(
+        (section) =>
+          new ScheduleOverride({
+            ...basePayload,
+            sectionId: section._id,
+            specificDate: date,
+            startDate: date,
+            endDate: date,
+            groupId,
+          })
+      );
     } else if (type === 'mid_break') {
       const startDate = normalizeDate(body.startDate);
       const endDate = normalizeDate(body.endDate);
@@ -194,9 +269,12 @@ router.post(
       let entry = null;
       let originalValues;
       let courseId;
+      // When the change targets a batch-shared CT, the same change is applied
+      // to every section copy so the batch stays consistent.
+      let targetGroupCopies = null;
 
-      // The target may be a routine entry (e.g. the daily CT slot) or a
-      // CR-declared extra class / class test (an extra_class override id).
+      // The target may be a routine entry or an already-declared override
+      // (extra class / class test id created by a CR declaration).
       if (body.routineEntryId) {
         if (!mongoose.isValidObjectId(body.routineEntryId)) {
           throw new AppError(404, 'Routine entry not found');
@@ -230,12 +308,19 @@ router.post(
             room: declared.room || null,
           };
           courseId = body.courseId || declared.courseId;
+          if (declared.groupId) {
+            targetGroupCopies = await ScheduleOverride.find({
+              groupId: declared.groupId,
+              _id: { $ne: declared._id },
+            }).sort({ createdAt: 1 });
+          }
         }
       } else {
         courseId = body.courseId || null;
         originalValues = { startTime: null, endTime: null, room: null };
       }
 
+      const changeGroupId = targetGroupCopies ? randomUUID() : null;
       override = new ScheduleOverride({
         ...basePayload,
         specificDate: date,
@@ -245,7 +330,13 @@ router.post(
         startTime: type === 'time_change' ? body.startTime || originalValues.startTime : originalValues.startTime,
         endTime: type === 'time_change' ? body.endTime || originalValues.endTime : originalValues.endTime,
         room: type === 'room_change' ? body.room : originalValues.room,
+        groupId: changeGroupId,
       });
+      if (targetGroupCopies) {
+        siblingsAdditional = targetGroupCopies.map((copy) =>
+          changeOverrideForCopy(basePayload, body, type, copy, changeGroupId)
+        );
+      }
     } else if (type === 'extra_class') {
       const date = normalizeDate(body.date);
       if (!date) throw new AppError(400, 'A valid date (YYYY-MM-DD) is required');
@@ -272,38 +363,130 @@ router.post(
         if (!body.courseId) {
           throw new AppError(400, 'courseId is required to declare a class test');
         }
+        // The routine no longer carries a fixed CT slot: every CT is declared
+        // with its own explicit times by the CR.
         if (!hasBothTimes) {
-          // No explicit time: land the CT in the section's CT slot (period 1)
-          // for that weekday so "declare CT" only needs a course + a date.
-          const day = dayNameFor(date);
-          const ctSlot = day
-            ? await RoutineEntry.findOne({ sectionId, day, classType: 'ct' }).sort({ period: 1 })
-            : null;
-          if (!ctSlot) {
-            throw new AppError(
-              400,
-              'startTime and endTime are required — the routine has no CT slot for this day'
-            );
-          }
-          startTime = ctSlot.startTime;
-          endTime = ctSlot.endTime;
+          throw new AppError(400, 'Both startTime and endTime are required to declare a class test');
         }
       }
 
-      override = new ScheduleOverride({
-        ...basePayload,
-        specificDate: date,
-        courseId: body.courseId || null,
-        startTime,
-        endTime,
-        room: body.room || null,
-        classType,
+      // A declared class test applies to the whole batch, not just the CR's
+      // own section: one copy per sibling section keeps every calendar in the
+      // batch correct (each section sees it through its own override).
+      const ownSectionDoc = await Section.findById(sectionId);
+      const batchId = idOf(ownSectionDoc?.batchId) || idOf(user.batchId);
+      const targetSections = batchId
+        ? await Section.find({ batchId }).select('_id').sort({ name: 1 })
+        : [];
+      if (targetSections.length === 0) targetSections.push({ _id: sectionId });
+
+      const groupId = randomUUID();
+      const created = [];
+      for (const section of targetSections) {
+        // Idempotent: a client retry after a lost response must not produce a
+        // duplicate CT on the same section / date / course / slot.
+        // eslint-disable-next-line no-await-in-loop
+        const dupe = await ScheduleOverride.findOne({
+          sectionId: section._id,
+          type: 'extra_class',
+          classType: 'ct',
+          specificDate: date,
+          courseId: body.courseId || null,
+          startTime,
+          endTime,
+          status: 'approved',
+        });
+        if (dupe) {
+          created.push(dupe);
+          continue;
+        }
+        // eslint-disable-next-line no-await-in-loop
+        created.push(
+          await ScheduleOverride.create({
+            ...basePayload,
+            sectionId: section._id,
+            specificDate: date,
+            courseId: body.courseId || null,
+            startTime,
+            endTime,
+            room: body.room || null,
+            classType,
+            groupId,
+          })
+        );
+      }
+
+      const ownOverride =
+        created.find((doc) => String(idOf(doc.sectionId)) === String(sectionId)) ?? created[0];
+
+      // ONE feed post scoped to the batch so every account — both sections —
+      // sees the CT in Updates. Per-section posts would show duplicates to
+      // batch viewers.
+      const departmentCode = await departmentCodeForBatch(batchId);
+      await Update.updateMany(
+        { sourceOverrideId: { $in: created.map((doc) => doc._id) } },
+        {
+          type: 'ct_reminder',
+          sectionId: null,
+          batchId: batchId || null,
+          departmentCode,
+          scope: 'batch',
+        }
+      );
+      let linkedUpdate = await Update.findOne({ sourceOverrideId: ownOverride._id });
+      if (!linkedUpdate) {
+        const populatedGroup = await ScheduleOverride.findById(ownOverride._id).populate(
+          overridePopulate
+        );
+        const feed = overrideFeedContent(populatedGroup);
+        linkedUpdate = await Update.create({
+          authorId: user._id,
+          sectionId: null,
+          batchId: batchId || null,
+          courseId: ownOverride.courseId || null,
+          type: feed.type,
+          title: feed.title,
+          description: feed.description,
+          priority: feed.priority,
+          scope: 'batch',
+          departmentCode,
+          status: 'approved',
+          sourceOverrideId: ownOverride._id,
+        });
+      }
+
+      await logAudit({
+        action: 'override_created',
+        user,
+        sectionId,
+        targetId: ownOverride._id,
+        details: `${type} (CT) for ${date} — batch-wide across ${
+          new Set(created.map((doc) => String(idOf(doc.sectionId)))).size
+        } section(s)`,
+        req,
       });
+
+      return sendData(
+        res,
+        {
+          id: String(ownOverride._id),
+          _id: String(ownOverride._id),
+          updateId: String(linkedUpdate._id),
+          groupId,
+          sectionIds: created.map((doc) => idOf(doc.sectionId)),
+          message: 'CT declared for the whole batch',
+        },
+        201
+      );
     } else {
       throw new AppError(400, 'Unknown override type');
     }
 
     await override.save();
+    for (const sibling of siblingsAdditional) {
+      // eslint-disable-next-line no-await-in-loop
+      await sibling.save();
+    }
     await logAudit({
       action: 'override_created',
       user,
@@ -311,14 +494,17 @@ router.post(
       targetId: override._id,
       details: `${type}${override.classType === 'ct' ? ' (CT)' : ''} for ${
         override.specificDate || `${override.startDate} → ${override.endDate}`
-      }`,
+      }${siblingsAdditional.length ? ` (+ ${siblingsAdditional.length} sibling section copy/ies)` : ''}`,
       req,
     });
 
     const populated = await ScheduleOverride.findById(override._id).populate(overridePopulate);
     // Mirror the declaration into the section feed so every student account
-    // sees it in Updates, not only inside the calendar on that exact date.
-    const linkedUpdate = await createLinkedUpdate(populated, user);
+    // sees it in Updates, not only inside the calendar on that exact date. A
+    // change to a batch-shared CT is posted batch-wide instead.
+    const linkedUpdate = siblingsAdditional.length
+      ? await createBatchLinkedUpdate(populated, user, siblingsAdditional[0])
+      : await createLinkedUpdate(populated, user);
     sendData(
       res,
       {
@@ -347,10 +533,25 @@ router.delete(
       throw new AppError(403, 'You cannot withdraw this declaration');
     }
 
+    // Batch-wide declarations (CT group) remove every sibling copy too, or
+    // other sections would keep a CT the CR already withdrew.
+    const groupIds = [override._id];
+    if (override.groupId) {
+      const siblings = await ScheduleOverride.find({
+        groupId: override.groupId,
+        _id: { $ne: override._id },
+      });
+      for (const sibling of siblings) {
+        // eslint-disable-next-line no-await-in-loop
+        await ScheduleOverride.findByIdAndDelete(sibling._id);
+        groupIds.push(sibling._id);
+      }
+    }
+
     await ScheduleOverride.findByIdAndDelete(req.params.id);
     // The matching feed post must disappear too, or students keep seeing a
     // cancelled notice after the CR withdrew it.
-    await Update.deleteMany({ sourceOverrideId: override._id });
+    await Update.deleteMany({ sourceOverrideId: { $in: groupIds } });
     await logAudit({
       action: 'override_withdrawn',
       user: req.user,
@@ -376,15 +577,28 @@ router.put(
     const override = await ScheduleOverride.findById(req.params.id);
     if (!override) throw new AppError(404, 'Override not found');
 
-    override.status = decision;
-    override.reviewNote = note || null;
-    override.reviewedBy = req.user._id;
-    override.reviewedAt = new Date();
-    await override.save();
+    // The review decision applies to every copy of a batch-wide group.
+    const reviewed = [override];
+    if (override.groupId) {
+      reviewed.push(
+        ...(await ScheduleOverride.find({
+          groupId: override.groupId,
+          _id: { $ne: override._id },
+        }))
+      );
+    }
+    for (const doc of reviewed) {
+      doc.status = decision;
+      doc.reviewNote = note || null;
+      doc.reviewedBy = req.user._id;
+      doc.reviewedAt = new Date();
+      // eslint-disable-next-line no-await-in-loop
+      await doc.save();
+    }
 
     if (decision === 'rejected') {
       // A rejected declaration must not linger in the section Updates feed.
-      await Update.deleteMany({ sourceOverrideId: override._id });
+      await Update.deleteMany({ sourceOverrideId: { $in: reviewed.map((doc) => doc._id) } });
     }
 
     await logAudit({

@@ -1,6 +1,6 @@
 import express from 'express';
 import { protect } from '../middleware/auth.js';
-import { Notification, User } from '../models/index.js';
+import { Notification } from '../models/index.js';
 import { AppError, asyncHandler, parsePagination, sendData } from '../utils/http.js';
 
 const router = express.Router();

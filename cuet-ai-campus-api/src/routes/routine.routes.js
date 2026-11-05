@@ -1,12 +1,10 @@
 import express from 'express';
 import { protect, requireCoordinator } from '../middleware/auth.js';
 import { RoutineEntry, Section } from '../models/index.js';
-import { asyncHandler, sendData } from '../utils/http.js';
-import { AppError } from '../utils/http.js';
+import { AppError, asyncHandler, sendData } from '../utils/http.js';
 import {
   routinePopulate,
   serializeRoutineEntry,
-  sortRoutineEntries,
 } from '../services/routineSerializer.js';
 import { logAudit } from '../services/audit.js';
 import { dayNameFor, todayISO } from '../utils/dates.js';

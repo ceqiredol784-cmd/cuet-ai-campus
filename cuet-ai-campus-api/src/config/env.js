@@ -34,10 +34,6 @@ export const env = Object.freeze({
     .filter(Boolean),
   publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, ''),
   timeZone: process.env.APP_TIME_ZONE || 'Asia/Dhaka',
-  enableDevLogin: bool(
-    process.env.ENABLE_DEV_LOGIN,
-    process.env.NODE_ENV !== 'production'
-  ),
   autoSeed: bool(process.env.AUTO_SEED, false),
   demoPassword: process.env.DEMO_PASSWORD || 'Campus123',
   uploadDir: path.isAbsolute(uploadDirRaw)
@@ -52,6 +48,11 @@ export const env = Object.freeze({
   openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
   geminiApiKey: process.env.GEMINI_API_KEY || '',
   geminiModel: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+  resendApiKey: process.env.RESEND_API_KEY || '',
+  resendFromEmail: process.env.RESEND_FROM_EMAIL || 'crazymahfuj1@gmail.com',
+  passwordResetUrl:
+    process.env.PASSWORD_RESET_URL || 'http://localhost:5173/reset-password',
+  passwordResetExpiresMinutes: int(process.env.PASSWORD_RESET_EXPIRES_MINUTES, 15),
   root,
 });
 

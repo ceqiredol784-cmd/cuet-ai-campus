@@ -1,11 +1,9 @@
-import { Attendance, RoutineEntry, ScheduleOverride, User } from '../models/index.js';
+import { Attendance, RoutineEntry, ScheduleOverride } from '../models/index.js';
 import {
   dateRange,
   dayNameFor,
-  timeToMinutes,
   endOfDay,
 } from '../utils/dates.js';
-import { serializeExam } from './routineSerializer.js';
 
 export async function getAttendanceView({ userId, sectionId, days = 90 }) {
   const from = endOfDay(new Date(Date.now() - (days - 1) * 86400000)).toISOString().slice(0, 10);

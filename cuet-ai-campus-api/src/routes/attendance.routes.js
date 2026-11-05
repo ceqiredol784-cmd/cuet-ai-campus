@@ -1,9 +1,8 @@
 import express from 'express';
 import { protect } from '../middleware/auth.js';
-import { Attendance, RoutineEntry, Course, ScheduleOverride } from '../models/index.js';
+import { Attendance, RoutineEntry, ScheduleOverride } from '../models/index.js';
 import { idOf } from '../services/access.js';
-import { asyncHandler, sendData } from '../utils/http.js';
-import { AppError } from '../utils/http.js';
+import { AppError, asyncHandler, sendData } from '../utils/http.js';
 
 const router = express.Router();
 router.use(protect);

@@ -7,7 +7,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { asyncHandler, sendData } from '../utils/http.js';
 import { AppError } from '../utils/http.js';
-import { publicUrl } from '../config/env.js';
 import { logAudit } from '../services/audit.js';
 
 const router = express.Router();

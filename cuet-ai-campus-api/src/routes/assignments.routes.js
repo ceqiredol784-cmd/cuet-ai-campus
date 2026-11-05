@@ -1,8 +1,7 @@
 import express from 'express';
 import { protect, requireCoordinator } from '../middleware/auth.js';
-import { Assignment, Section, Course, Teacher, User } from '../models/index.js';
-import { asyncHandler, sendData } from '../utils/http.js';
-import { AppError } from '../utils/http.js';
+import { Assignment } from '../models/index.js';
+import { AppError, asyncHandler, sendData } from '../utils/http.js';
 import { assertSectionInCoordinatorScope, idOf } from '../services/access.js';
 
 const isStaff = (user) =>

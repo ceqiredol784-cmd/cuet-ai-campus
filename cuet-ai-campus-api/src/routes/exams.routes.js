@@ -1,9 +1,8 @@
 import express from 'express';
 import { protect, requireCr } from '../middleware/auth.js';
-import { Exam, Section, Course } from '../models/index.js';
+import { Exam, Section } from '../models/index.js';
 import { EXAM_TYPES } from '../constants.js';
-import { asyncHandler, sendData } from '../utils/http.js';
-import { AppError } from '../utils/http.js';
+import { AppError, asyncHandler, sendData } from '../utils/http.js';
 import { assertSectionInCoordinatorScope, idOf, sameId } from '../services/access.js';
 
 const isStaff = (user) =>

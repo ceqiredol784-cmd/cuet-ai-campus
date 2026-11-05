@@ -14,7 +14,6 @@ import {
   isStaffEmail,
   isStudentEmail,
   normalizeEmail,
-  normalizeStudentId,
   studentIdFromEmail,
   validateName,
   validatePassword,
@@ -46,6 +45,73 @@ const sessionPayload = (user, token) => ({
     hasPassword: user.hasPassword,
   },
 });
+
+async function sendPasswordResetEmail({ email, name, token }) {
+  const resetUrl = new URL(env.passwordResetUrl);
+  resetUrl.searchParams.set('token', token);
+
+  if (!env.resendApiKey) {
+    if (!env.isProduction) {
+      console.warn(
+        `[auth] RESEND_API_KEY is not configured; password reset link for ${email}: ${resetUrl}`
+      );
+      return;
+    }
+    throw new AppError(503, 'Password reset email service is not configured');
+  }
+
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.resendApiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: env.resendFromEmail,
+      to: [email],
+      subject: 'Reset your CUET AI Campus password',
+      text: [
+        `Hello ${name || 'there'},`,
+        '',
+        'We received a request to reset your CUET AI Campus password.',
+        `Open this link within ${env.passwordResetExpiresMinutes} minutes:`,
+        String(resetUrl),
+        '',
+        'If you did not request this, you can ignore this email.',
+      ].join('\n'),
+      html: `
+        <div style="font-family:Arial,sans-serif;line-height:1.6;color:#172033">
+          <h2>Reset your CUET AI Campus password</h2>
+          <p>Hello ${String(name || 'there').replace(/[<>&"]/g, '')},</p>
+          <p>We received a request to reset your password.</p>
+          <p>
+            <a href="${String(resetUrl).replace(/"/g, '&quot;')}"
+               style="display:inline-block;padding:12px 18px;background:#1769aa;color:#fff;text-decoration:none;border-radius:8px">
+              Reset Password
+            </a>
+          </p>
+          <p>This link expires in ${env.passwordResetExpiresMinutes} minutes.</p>
+          <p>If you did not request this, you can ignore this email.</p>
+        </div>
+      `,
+    }),
+  });
+
+  if (!response.ok) {
+    const details = await response.text();
+    console.error(`[auth] Resend failed (${response.status}): ${details}`);
+    if (response.status === 401) {
+      throw new AppError(503, 'Resend API key is invalid or revoked');
+    }
+    if (response.status === 403) {
+      throw new AppError(
+        503,
+        'Resend rejected this test email. With onboarding@resend.dev, the recipient must be your verified Resend account email; verify a sending domain to email other users.'
+      );
+    }
+    throw new AppError(503, 'Unable to send the password reset email');
+  }
+}
 
 router.post(
   '/register',
@@ -160,30 +226,6 @@ router.post(
   })
 );
 
-router.post(
-  '/dev-login',
-  authLimiter,
-  asyncHandler(async (req, res) => {
-    if (!env.enableDevLogin || env.isProduction) {
-      throw new AppError(403, 'Developer login is disabled');
-    }
-
-    const email = normalizeEmail(req.body?.email);
-    if (!email) throw new AppError(400, 'Email is required');
-
-    const user = await User.findOne({ email });
-    if (!user || !user.isActive) {
-      throw new AppError(404, 'No demo account exists for this email');
-    }
-
-    user.lastLoginAt = new Date();
-    await user.save();
-
-    const token = signToken(user);
-    sendData(res, sessionPayload(user, token));
-  })
-);
-
 router.get(
   '/me',
   protect,
@@ -235,14 +277,16 @@ router.post(
       .createHash('sha256')
       .update(rawToken)
       .digest('hex');
-    user.passwordResetExpires = new Date(Date.now() + 60 * 60 * 1000);
+    user.passwordResetExpires = new Date(
+      Date.now() + env.passwordResetExpiresMinutes * 60 * 1000
+    );
     await user.save();
 
-    if (!env.isProduction) {
-      console.log(
-        `[auth] password reset for ${email}: /reset-password?token=${rawToken}`
-      );
-    }
+    await sendPasswordResetEmail({
+      email,
+      name: user.name,
+      token: rawToken,
+    });
 
     sendData(res, generic);
   })

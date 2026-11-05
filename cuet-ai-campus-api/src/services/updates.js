@@ -1,14 +1,11 @@
 import {
-  User,
   Update,
   Batch,
   Section,
-  Course,
   CRAssignment,
 } from '../models/index.js';
 import {
   UPDATE_SCOPES,
-  DEFAULT_CR_UPDATE_PERMISSIONS,
 } from '../constants.js';
 import { isAdmin, isCoordinator } from '../middleware/auth.js';
 import { idOf } from './access.js';

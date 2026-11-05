@@ -19,7 +19,8 @@ let sectionBId;
 let ctDateIso;
 let ctDayName;
 let ctCourseId;
-let ctSlotEntry;
+let ctDeclaredStart;
+let ctDeclaredEnd;
 let ctOverrideId;
 let cancelDateIso;
 
@@ -48,8 +49,10 @@ function nextTeachingDate(minOffset = 1) {
 }
 
 async function loginAs(email) {
-  const res = await request(app).post('/api/v1/auth/dev-login').send({ email });
-  assert.strictEqual(res.status, 200, `dev-login ${email}: ${JSON.stringify(res.body)}`);
+  const res = await request(app)
+    .post('/api/v1/auth/login')
+    .send({ email, password: env.demoPassword });
+  assert.strictEqual(res.status, 200, `login ${email}: ${JSON.stringify(res.body)}`);
   return res.body.data.token;
 }
 
@@ -391,7 +394,29 @@ describe('CUET AI Campus API', () => {
     assert.strictEqual(res.status, 400);
   });
 
-  it('declares a CT as CR and lands it in the routine CT slot when no time is given', async () => {
+  it('rejects a CT declaration without times', async () => {
+    const { dateIso } = nextTeachingDate(3);
+    const weekly = await request(app)
+      .get('/api/v1/routine/weekly')
+      .query({ sectionId: sectionBId })
+      .set('Authorization', `Bearer ${crToken}`);
+    const lecture = weekly.body.data.find(
+      (e) => e.courseId?.code && e.courseId.code !== 'CT'
+    );
+    const res = await request(app)
+      .post('/api/v1/overrides')
+      .send({
+        type: 'extra_class',
+        classType: 'ct',
+        date: dateIso,
+        courseId: String(lecture.courseId._id || lecture.courseId),
+        reason: 'a declared CT always carries its own times',
+      })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('declares a CT as CR with explicit times and shows it on the calendar', async () => {
     const found = nextTeachingDate(4);
     ctDateIso = found.dateIso;
     ctDayName = found.dayName;
@@ -400,15 +425,17 @@ describe('CUET AI Campus API', () => {
       .get('/api/v1/routine/weekly')
       .query({ sectionId: sectionBId })
       .set('Authorization', `Bearer ${crToken}`);
-    const allEntries = weekly.body.data;
-    ctSlotEntry = allEntries.find((e) => e.day === ctDayName && e.classType === 'ct');
-    assert.ok(ctSlotEntry, `Section B should have a CT slot on ${ctDayName}`);
-
-    const lecture = allEntries.find(
+    assert.strictEqual(weekly.status, 200);
+    const lecture = weekly.body.data.find(
       (e) => e.day === ctDayName && e.courseId?.code && e.courseId.code !== 'CT'
     );
     assert.ok(lecture);
     ctCourseId = String(lecture.courseId._id || lecture.courseId);
+
+    // The routine no longer carries a fixed CT slot: a declared CT always
+    // carries the CR's explicit times and lands on both sections' calendars.
+    ctDeclaredStart = '11:00';
+    ctDeclaredEnd = '11:30';
 
     const res = await request(app)
       .post('/api/v1/overrides')
@@ -417,6 +444,8 @@ describe('CUET AI Campus API', () => {
         classType: 'ct',
         date: ctDateIso,
         courseId: ctCourseId,
+        startTime: ctDeclaredStart,
+        endTime: ctDeclaredEnd,
         reason: 'CSE CT-1 · chapters 1–3',
       })
       .set('Authorization', `Bearer ${crToken}`);
@@ -435,8 +464,8 @@ describe('CUET AI Campus API', () => {
     assert.ok(declared, 'declared CT should appear on the calendar');
     assert.strictEqual(declared.classType, 'ct');
     assert.strictEqual(declared.status, 'extra');
-    assert.strictEqual(declared.startTime, ctSlotEntry.startTime);
-    assert.strictEqual(declared.endTime, ctSlotEntry.endTime);
+    assert.strictEqual(declared.startTime, ctDeclaredStart);
+    assert.strictEqual(declared.endTime, ctDeclaredEnd);
     assert.strictEqual(String(declared.courseId?._id || declared.courseId), ctCourseId);
   });
 
@@ -467,8 +496,8 @@ describe('CUET AI Campus API', () => {
     assert.strictEqual(shifted.classType, 'ct');
     assert.strictEqual(shifted.startTime, '15:00');
     assert.strictEqual(shifted.endTime, '16:00');
-    assert.strictEqual(shifted.original?.startTime, ctSlotEntry.startTime);
-    assert.strictEqual(shifted.original?.endTime, ctSlotEntry.endTime);
+    assert.strictEqual(shifted.original?.startTime, ctDeclaredStart);
+    assert.strictEqual(shifted.original?.endTime, ctDeclaredEnd);
   });
 
   it('cancels a declared CT and keeps its effective time as original', async () => {
@@ -497,43 +526,50 @@ describe('CUET AI Campus API', () => {
     assert.strictEqual(cancelled.original?.startTime, '15:00');
   });
 
-  it('cancels the routine CT slot for a date', async () => {
-    const ctSlotId = String(ctSlotEntry.id || ctSlotEntry._id);
-    const res = await request(app)
+  it('shows a CT declared in one section to the whole batch (both sections)', async () => {
+    // CT declarations are batch-wide: the Section B CR's CT must appear on
+    // Section A's calendar too, at the same declared slot. A fresh date is
+    // used because the earlier CT has been cancelled by this point.
+    const { dateIso } = nextTeachingDate(5);
+    const weekly = await request(app)
+      .get('/api/v1/routine/weekly')
+      .query({ sectionId: sectionBId })
+      .set('Authorization', `Bearer ${crToken}`);
+    const courseId = weekly.body.data[0].courseId._id;
+
+    const created = await request(app)
       .post('/api/v1/overrides')
       .send({
-        type: 'class_cancellation',
-        date: ctDateIso,
-        routineEntryId: ctSlotId,
-        reason: 'No CT this week',
+        type: 'extra_class',
+        classType: 'ct',
+        date: dateIso,
+        courseId,
+        startTime: '09:10',
+        endTime: '09:50',
+        reason: 'Batch-wide visibility check',
       })
       .set('Authorization', `Bearer ${crToken}`);
-    assert.strictEqual(res.status, 201, JSON.stringify(res.body));
-
-    const day = await request(app)
-      .get('/api/v1/calendar/day')
-      .query({ date: ctDateIso, sectionId: sectionBId })
-      .set('Authorization', `Bearer ${crToken}`);
-    assert.strictEqual(day.status, 200);
-    const slot = day.body.data.classes.find((c) => String(c._id || c.id) === ctSlotId);
-    assert.ok(slot, 'CT slot should appear (cancelled)');
-    assert.strictEqual(slot.status, 'cancelled');
-    assert.strictEqual(slot.classType, 'ct');
-    assert.ok(slot.original, 'cancelled slot should snapshot its original times');
-  });
-
-  it('does not leak the declared CT to another section', async () => {
-    const res = await request(app)
-      .get('/api/v1/calendar/day')
-      .query({ date: ctDateIso, sectionId: sectionAId })
-      .set('Authorization', `Bearer ${studentAToken}`);
-    assert.strictEqual(res.status, 200);
-    const leaked = res.body.data.classes.filter(
-      (c) =>
-        c.status === 'extra' &&
-        String(c.courseId?._id || c.courseId) === ctCourseId
+    assert.strictEqual(created.status, 201, JSON.stringify(created.body));
+    assert.ok(
+      (created.body.data.sectionIds ?? []).length >= 2,
+      'one request must create a copy per batch section'
     );
-    assert.strictEqual(leaked.length, 0);
+
+    for (const [sectionToken, id] of [
+      [studentAToken, sectionAId],
+      [crToken, sectionBId],
+    ]) {
+      // eslint-disable-next-line no-await-in-loop
+      const day = await request(app)
+        .get('/api/v1/calendar/day')
+        .query({ date: dateIso, sectionId: id })
+        .set('Authorization', `Bearer ${sectionToken}`);
+      assert.strictEqual(day.status, 200);
+      const ct = day.body.data.classes.find(
+        (cls) => cls.status === 'extra' && cls.classType === 'ct' && cls.startTime === '09:10'
+      );
+      assert.ok(ct, `calendar of section ${id} must show the batch-wide CT`);
+    }
   });
 
   it('shows a demo CR CT to the student and coordinator across accounts', async () => {
@@ -574,7 +610,9 @@ describe('CUET AI Campus API', () => {
     );
     assert.ok(notice, 'student should see the CT declaration in Updates');
     assert.strictEqual(notice.type, 'ct_reminder');
-    assert.strictEqual(String(notice.sectionId?._id || notice.sectionId), String(sectionAId));
+    // The feed post targets the whole batch so BOTH sections see it.
+    assert.strictEqual(notice.scope, 'batch');
+    assert.ok(String(notice.batchId?._id || notice.batchId), 'batch id must be set');
 
     // …and on their calendar for that date.
     const studentDay = await request(app)
@@ -691,11 +729,23 @@ describe('CUET AI Campus API', () => {
       .set('Authorization', `Bearer ${crToken}`);
     assert.strictEqual(crBUpdates.status, 200);
     assert.ok(crBUpdates.body.data.items.length > 0);
+    const bItems = crBUpdates.body.data.items;
+    // Section B CR sees Section B announcements when they exist…
     assert.ok(
-      crBUpdates.body.data.items.some(
-        (update) => update.scope === 'section' && sectionIdOfUpdate(update) === sectionBId
+      bItems.some(
+        (update) =>
+          (update.scope === 'section' && sectionIdOfUpdate(update) === sectionBId) ||
+          // CT declarations are batch-wide: the CR's own CT post is batch-scoped.
+          (update.scope === 'batch' && update.type === 'ct_reminder')
       ),
-      'Section B CR should see Section B announcements'
+      'Section B CR should see Section B announcements / their batch CT'
+    );
+    // …and Section A announcements are not.
+    assert.ok(
+      !bItems.some(
+        (update) => update.scope === 'section' && sectionIdOfUpdate(update) === sectionAId
+      ),
+      'Section B CR must not receive Section A announcements'
     );
   });
 

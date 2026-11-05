@@ -9,8 +9,6 @@ import {
   AssignmentRule,
   AuditLog,
   Update,
-  AcademicSession,
-  Term,
   ScheduleOverride,
 } from '../models/index.js';
 import { asyncHandler, sendData } from '../utils/http.js';
@@ -20,12 +18,9 @@ import {
   idOf,
   userBatchId,
   userDepartmentId,
-  userSectionId,
-  sameId,
 } from '../services/access.js';
 import { logAudit } from '../services/audit.js';
 import { departmentCodeForBatch, normalizeEventFields } from '../services/updates.js';
-import { resolveDepartment, resolveBatch, resolveSection, resolveTerm, resolveSession } from '../services/academicResolver.js';
 
 const router = express.Router();
 router.use(protect);

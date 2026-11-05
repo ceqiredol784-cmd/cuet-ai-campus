@@ -11,7 +11,6 @@ import {
 import { AppError } from '../utils/http.js';
 import {
   examPopulate,
-  overridePopulate,
   routinePopulate,
   serializeExam,
   serializeRoutineEntry,

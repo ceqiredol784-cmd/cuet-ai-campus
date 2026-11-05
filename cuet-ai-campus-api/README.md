@@ -35,10 +35,9 @@ courses, exams, assignments, notices); no other users exist.
 | Email | Role | Section |
 |---|---|---|
 | u2204001@student.cuet.ac.bd | Student | A |
-| u2204002@student.cuet.ac.bd | Student + CR | B |
+| u2204002@student.cuet.ac.bd | Student + CR | A |
+| u2204003@student.cuet.ac.bd | Student | B |
 | coordinator@cuet.ac.bd | Coordinator | A (department-wide access) |
-
-Development-only: `POST /api/v1/auth/dev-login?email=...` issues a session token without a password (the React quick-login cards use this). Disable with `ENABLE_DEV_LOGIN=false`; it is always disabled in production.
 
 ## Seed
 
@@ -72,7 +71,7 @@ tests/
 ## Key design notes
 
 - **Response envelope**: `{"success": true, "data": ...}`. Errors: `{"success": false, "message": "..."}`.
-- **Auth**: JWT (`Authorization: Bearer <token>`), bcrypt password hashing, `/auth/login`, `/auth/register`, `/auth/dev-login` (dev only), `/auth/me`, `/auth/set-password`, `/auth/forgot-password`.
+- **Auth**: JWT (`Authorization: Bearer <token>`), bcrypt password hashing, `/auth/login`, `/auth/register`, `/auth/me`, `/auth/set-password`, `/auth/forgot-password`.
 - **Profile**: `/auth/me` returns the user with populated `departmentId`, `batchId`, `sectionId` (with `termId` as a string) and `academicSessionId`, matching the React `parseUserProfile` contract.
 - **Section scoping**: students/CRs see only their own section; coordinators see their department/batch sections; admins are global. CRs cannot create overrides/announcements for other sections.
 - **Calendar/effective schedule**: `GET /api/v1/calendar/day?date=YYYY-MM-DD&sectionId=` merges the official weekly routine with approved overrides (cancellation, room/time change, extra class, auto day off, mid-break) and exams for the date. Original room/time values are preserved in `original`. `GET /calendar/range` returns per-day statuses for month markers.
