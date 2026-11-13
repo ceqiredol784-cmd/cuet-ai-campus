@@ -160,29 +160,83 @@ router.post(
   })
 );
 
+const TEACHING_DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday'];
+
+function minutesOf(value) {
+  const match = /^(\d{1,2}):(\d{2})/.exec(String(value || ''));
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}
+
+/**
+ * Finds the next class for the deterministic assistant: the first class still
+ * running/upcoming today, otherwise the first class of the next teaching day.
+ */
+function nextClassEntry(routine) {
+  const own = (routine || []).filter((entry) => entry.day && !entry.isBreak);
+  if (own.length === 0) return null;
+
+  const now = new Date();
+  const todayName = now.toLocaleDateString('en-US', { weekday: 'long', timeZone: env.timeZone });
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+
+  const todayEntries = own
+    .filter((entry) => String(entry.day).toLowerCase() === todayName.toLowerCase())
+    .sort((a, b) => (minutesOf(a.startTime) ?? 0) - (minutesOf(b.startTime) ?? 0));
+  const upcoming = todayEntries.find((entry) => {
+    const end = minutesOf(entry.endTime);
+    return end == null || end > nowMinutes;
+  });
+  if (upcoming) return upcoming;
+
+  const startIndex = TEACHING_DAYS.indexOf(todayName);
+  for (let offset = 1; offset <= TEACHING_DAYS.length; offset += 1) {
+    const dayName = TEACHING_DAYS[(Math.max(startIndex, 0) + offset) % TEACHING_DAYS.length];
+    const first = own
+      .filter((entry) => String(entry.day).toLowerCase() === dayName.toLowerCase())
+      .sort((a, b) => (minutesOf(a.startTime) ?? 0) - (minutesOf(b.startTime) ?? 0))[0];
+    if (first) return first;
+  }
+  return null;
+}
+
 function deterministicReply(message, user, context = null) {
   const text = String(message || '').toLowerCase();
   const name = user?.name || 'there';
-
   if (context?.conflicts?.length && /(conflict|clash|overlap)/.test(text)) {
-    return `I found ${context.conflicts.length} conflict(s): ${context.conflicts
-      .map((conflict) => conflict.description)
-      .join('; ')}`;
+    return [
+      `I found **${context.conflicts.length} schedule conflict${context.conflicts.length === 1 ? '' : 's'}** in your routine:`,
+      '',
+      ...context.conflicts.map((conflict) => `- ${conflict.description}`),
+      '',
+      'Open **Routine → Conflicts** to review them in detail.',
+    ].join('\n');
   }
   if (context?.exams?.length && /exam|test|ct|midterm|final/.test(text)) {
-    return `Your exams: ${context.exams
-      .map((exam) => `${exam.course?.code || exam.courseId} on ${exam.examDate} at ${exam.startTime}-${exam.endTime}`)
-      .join('; ')}.`;
+    return [
+      '### Your upcoming exams',
+      '',
+      '| Course | Type | Date | Time | Room |',
+      '| --- | --- | --- | --- | --- |',
+      ...context.exams.map(
+        (exam) =>
+          `| ${exam.course?.code || exam.courseId} | ${exam.examType || 'exam'} | ${exam.examDate} | ${exam.startTime}–${exam.endTime} | ${exam.room || '—'} |`
+      ),
+    ].join('\n');
   }
   if (context?.updates?.length && /notice|announcement|update/.test(text)) {
     if (/last|latest|most recent/.test(text)) {
       const latest = context.updates[0];
-      return `The latest notice is "${latest.title}": ${latest.description}`;
+      return ['### Latest notice', '', `**${latest.title}**`, '', latest.description || ''].join(
+        '\n'
+      );
     }
-    return `Latest notices: ${context.updates
-      .slice(0, 10)
-      .map((update) => `${update.title}: ${update.description}`)
-      .join(' | ')}`;
+    return [
+      '### Latest notices',
+      '',
+      ...context.updates
+        .slice(0, 10)
+        .map((update) => `- **${update.title}** — ${update.description}`),
+    ].join('\n');
   }
   const requestedDay = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday'].find((day) =>
     text.includes(day)
@@ -194,37 +248,81 @@ function deterministicReply(message, user, context = null) {
         entry.sectionName === sectionName &&
         String(entry.day || '').toLowerCase() === requestedDay
     );
+    const dayLabel = `${requestedDay[0].toUpperCase()}${requestedDay.slice(1)}`;
     if (entries?.length) {
-      return `${requestedDay[0].toUpperCase()}${requestedDay.slice(1)} routine for Section ${sectionName}: ${entries
-        .map(
+      return [
+        `### ${dayLabel} routine — Section ${sectionName}`,
+        '',
+        '| Time | Course | Room |',
+        '| --- | --- | --- |',
+        ...entries.map(
           (entry) =>
-            `${entry.startTime}-${entry.endTime} ${entry.course?.code || entry.courseId}${entry.room ? ` in ${entry.room}` : ''}`
-        )
-        .join('; ')}.`;
+            `| ${entry.startTime}–${entry.endTime} | ${entry.course?.code || entry.courseId} | ${entry.room || '—'} |`
+        ),
+      ].join('\n');
     }
-    return `No routine entries were found for ${requestedDay[0].toUpperCase()}${requestedDay.slice(1)} for your section.`;
+    return `No routine entries were found for **${dayLabel}** in your section.`;
   }
   if (/next class/.test(text)) {
-    const sectionName = String(user.sectionId?.name || user.sectionId?.label || '');
-    const next = context?.routine?.find((entry) => entry.sectionName === sectionName);
-    return next
-      ? `Hi ${name}, your routine includes ${next.course?.code || next.courseId} at ${next.startTime} in ${next.room || 'the assigned room'}.`
-      : `Hi ${name}, I could not find a class in your current routine.`;
+    const next = nextClassEntry(context?.routine?.filter((entry) => entry.sectionName === String(user.sectionId?.name || user.sectionId?.label || '')));
+    if (next) {
+      const code = next.course?.code || next.courseId;
+      const isToday = String(next.day).toLowerCase() === new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: env.timeZone }).toLowerCase();
+      return [
+        `Hi **${name}**, here is what your routine shows:`,
+        '',
+        `- **${code}** at **${next.startTime}–${next.endTime}**${next.room ? ` in ${next.room}` : ''} (${isToday ? 'today' : `next ${next.day}`})`,
+        '',
+        'Open the **Calendar** for the full date-aware schedule.',
+      ].join('\n');
+    }
+    return `Hi **${name}**, I could not find a class in your current routine.`;
   }
   if (/attendance/.test(text)) {
-    return `Hi ${name}, visit the Attendance page to see your current percentage and recent absences.`;
+    return [
+      `Hi **${name}**! To check your attendance:`,
+      '',
+      '1. Open the **Attendance** page from the bottom navigation.',
+      '2. Your overall percentage and per-course breakdown appear at the top.',
+      `3. Aim to stay **above 85%** to remain eligible for exams.`,
+    ].join('\n');
   }
   if (/exam/.test(text)) {
-    return `Hi ${name}, your upcoming exams appear on the Calendar and Exams pages for your section.`;
+    return [
+      `Hi **${name}**! Your exams appear in two places:`,
+      '',
+      '- **Calendar** — exam days are marked on the month grid.',
+      '- **Exams page** — the full list with dates, times and rooms.',
+      '',
+      'Ask me *"when is my next exam?"* and I will list them here.',
+    ].join('\n');
   }
   if (/assign/.test(text)) {
-    return `Hi ${name}, open the Assignments page to see deadlines and mark work as complete.`;
+    return [
+      `Hi **${name}**! Open the **Assignments** page to see deadlines and mark work as complete.`,
+      '',
+      'The **Home screen** also counts how many assignments are due within the next 7 days.',
+    ].join('\n');
   }
   if (/hello|hi|hey/.test(text)) {
-    return `Hi ${name}! I'm your campus assistant. Ask me about your next class, attendance, exams, or assignments.`;
+    return [
+      `Hi **${name}**! I'm your campus assistant. I can help with:`,
+      '',
+      '- **Next class** — *"What is my next class?"*',
+      '- **Routine** — *"Show me my Monday schedule"*',
+      '- **Exams** — *"When is my next exam?"*',
+      '- **Notices** — *"Any new notices?"*',
+    ].join('\n');
   }
 
-  return `Hi ${name}, I received your message: "${message}". I can help with class schedules, attendance, exams, and assignments.`;
+  return [
+    `Hi **${name}**! I received your message, but right now I can only answer from your campus data. Try asking about:`,
+    '',
+    '- Your **next class** or weekly routine',
+    '- **Attendance** status',
+    '- Upcoming **exams**',
+    '- **Assignments** and deadlines',
+  ].join('\n');
 }
 
 function buildContextText({ routine, updates, exams, conflicts }) {
@@ -327,6 +425,13 @@ async function generateChatReply({ message, history, user, headers, context }) {
     'You are the CUET AI Campus assistant. Answer student questions about their class',
     'schedule, attendance, exams, assignments, and notices using only the context they',
     'provide. Keep replies short and helpful. Batch numbers are numeric cohort codes such as 22, not years.',
+    'Formatting rules (follow them exactly):',
+    '- Reply in clean Markdown that renders in a chat bubble.',
+    '- Start with one short direct answer sentence.',
+    '- Use ### headings, **bold labels** and bullet lists to organise details.',
+    '- When listing classes, exams or notices, prefer a Markdown table',
+    '  (columns: Course | Day/Date | Time | Room).',
+    '- Keep replies under ~180 words. Never dump raw unstructured text.',
     context?.text || '',
   ].join('\n');
 
