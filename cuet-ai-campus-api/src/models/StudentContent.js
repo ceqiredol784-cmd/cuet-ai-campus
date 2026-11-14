@@ -67,6 +67,17 @@ const examSchema = new mongoose.Schema(
     room: { type: String, default: null },
     venue: { type: String, default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    // CR-submitted exams stay `pending` until a coordinator approves them;
+    // coordinator/admin-created exams are approved immediately.
+    status: {
+      type: String,
+      enum: ['pending', 'approved', 'rejected'],
+      default: 'approved',
+      index: true,
+    },
+    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    reviewedAt: { type: Date, default: null },
+    reviewNote: { type: String, default: null },
   },
   baseOptions
 );

@@ -19,6 +19,21 @@ export function userDepartmentId(user) {
   return idOf(user?.departmentId);
 }
 
+/**
+ * A CR may manage the routine (and routine proposals) of their own section or
+ * a sibling section of the same batch — batches have two sections and the CR
+ * team builds both routines.
+ */
+export async function assertSectionWritableByCr(user, section) {
+  if (!section) throw new AppError(404, 'Section not found');
+  if (isAdmin(user) || isCoordinator(user)) return;
+  if (sameId(userSectionId(user), section._id)) return;
+  const crBatch = userBatchId(user);
+  const sectionBatch = idOf(section.batchId?._id ?? section.batchId);
+  if (hasRole(user, 'cr') && crBatch && sectionBatch && sameId(crBatch, sectionBatch)) return;
+  throw new AppError(403, 'You can only manage routines of sections in your own batch');
+}
+
  /** Resolves and authorizes a section for a schedule/calendar request. */
 export async function resolveSectionForUser(user, requestedSectionId = null) {
   if (requestedSectionId) {
@@ -41,7 +56,15 @@ export async function resolveSectionForUser(user, requestedSectionId = null) {
           throw new AppError(403, 'This section is outside your department');
         }
       } else if (!sameId(ownSection, section._id)) {
-        throw new AppError(403, 'You can only view your own section');
+        // A CR may READ the schedule of a sibling section in their own batch —
+        // they need it to aim class declarations at that section.
+        const crBatch = userBatchId(user);
+        const sectionBatch = idOf(section.batchId?._id ?? section.batchId);
+        const crMayView =
+          hasRole(user, 'cr') && crBatch && sectionBatch && sameId(crBatch, sectionBatch);
+        if (!crMayView) {
+          throw new AppError(403, 'You can only view your own section');
+        }
       }
     }
 

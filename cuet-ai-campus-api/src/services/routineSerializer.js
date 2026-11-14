@@ -38,8 +38,14 @@ export function serializeRoutineEntry(entry) {
   raw.isRead = Boolean(raw.isRead);
   raw.isBreak = Boolean(raw.isBreak);
   raw.session = raw.session || null;
-  raw.instructor = teacher?.name ? [teacher.name] : [];
-  raw.instructorState = teacher?.name ? 'session_specific' : 'unspecified';
+  // One linked teacher wins; otherwise fall back to the free-text teacher
+  // list (a class may be taken by one, two or more teachers).
+  raw.instructor = teacher?.name
+    ? [teacher.name]
+    : Array.isArray(raw.teacherNames) && raw.teacherNames.length > 0
+      ? raw.teacherNames.filter(Boolean)
+      : [];
+  raw.instructorState = raw.instructor.length > 0 ? 'session_specific' : 'unspecified';
   return raw;
 }
 

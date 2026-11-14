@@ -57,6 +57,28 @@ export const primaryRoleFor = (roles = []) => {
 
 export const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday'];
 
+/**
+ * The official CUET period structure (Periods 1–9, Sunday–Thursday).
+ * Break (10:30–10:45) sits between periods 3 and 4; Lunch (13:00–13:45)
+ * between periods 6 and 7 — a single class can never span those gaps.
+ */
+export const PERIOD_TIMES = {
+  1: { startTime: '08:10', endTime: '09:00' },
+  2: { startTime: '09:00', endTime: '09:45' },
+  3: { startTime: '09:45', endTime: '10:30' },
+  4: { startTime: '10:45', endTime: '11:30' },
+  5: { startTime: '11:30', endTime: '12:15' },
+  6: { startTime: '12:15', endTime: '13:00' },
+  7: { startTime: '13:45', endTime: '14:30' },
+  8: { startTime: '14:30', endTime: '15:15' },
+  9: { startTime: '15:15', endTime: '16:00' },
+};
+
+/** True when [from, to] crosses the Break or Lunch gap. */
+export function periodRangeCrossesBreak(from, to) {
+  return (from <= 3 && to >= 4) || (from <= 6 && to >= 7);
+}
+
 export const UPDATE_TYPES = [
   'announcement',
   'cancellation',
@@ -85,6 +107,7 @@ export const OVERRIDE_TYPES = [
   'room_change',
   'time_change',
   'extra_class',
+  'classes_end',
 ];
 
 export const OVERRIDE_STATUSES = ['pending', 'approved', 'rejected', 'expired'];

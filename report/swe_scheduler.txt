@@ -1,0 +1,89 @@
+B.Sc in Computer Science & Engineering
+
+ CSE-356: Software Engineering (Sessional)
+
+Smart University Event & Routine Manager
+
+                    Submitted by:
+
+                                 Md. Mahfuj
+                                 ID: 2204037
+                           Iftear Ahmed Tahsin
+                                 ID: 2204041
+                          Md. Abdulla Al Nishat
+                                 ID: 2204042
+
+                          Submitted to:
+
+  Mir Md. Saki Kowsar                        Md. Refaj Hossan
+     Assistant Professor                            Lecturer
+
+Department of CSE, CUET                  Department of CSE, CUET
+
+     Department of Computer Science and Engineering
+Chittagong University of Engineering and Technology (CUET)
+
+                               July, 2026
+1 Introduction
+
+Managing academic schedules becomes challenging when students need to keep track of class
+routines, exams, assignment deadlines, holidays and club events from multiple sources. Con-
+flicting schedules and missed deadlines often reduce productivity. The proposed Smart Uni-
+versity Event & Routine Manager provides a centralized platform that integrates all uni-
+versity events into a single calendar while using AI to detect conflicts, predict workload and
+generate personalized study plans.
+
+2 Project Objectives
+
+    · Develop an AI-powered event and routine management system that helps students orga-
+       nize their academic schedules efficiently.
+
+    · Integrate class routines, exams, holidays and events into one platform.
+    · AI based scheduling conflict detection.
+    · Send personalized reminders and notifications.
+
+3 Scope of the Project
+
+Included: Class routine and academic calendar management, assignment, exam and event
+scheduling, AI-based conflict detection, AI-based slot recommendations, personalized reminders
+and notifications.
+Not Included: Video conferencing, learning Management System (LMS) features, automatic
+grading or assignment submission.
+
+4 Proposed Features
+
+    · Academic calendar dashboard.
+    · Class, exam and event management.
+    · Conflict detection and schedule suggestions.
+    · Personalized reminders.
+
+                                                        1
+5 Methodology
+
+The project will follow the Waterfall Software Development Model. The project will use
+Flutter, Go, REST API, NoSQL, HTML5, CSS3, JavaScript, React Wrapper, Node.js, Authen-
+tication, BREVO API, Firebase, Docker, Git, OpenAI API, Gemini API, GitHub and GitHub
+Actions.
+
+6 Expected Outcomes
+
+    · Functional event and routine management application.
+    · AI-generated slot recommendations.
+    · Intelligent conflict detection.
+    · Complete source code and SDLC documentation.
+
+7 Tools & Resources Required
+
+Hardware: Laptop, Android Phone, Internet.
+Software: VS Code, MongoDB Atlas, GitHub, OpenAI API, Gemini API, Brevo API, Google
+Calander API, Render, Android Studio.
+
+8 Conclusion
+
+The Smart University Event & Routine Manager provides a centralized platform for managing
+academic schedules and university events. By combining AI-powered conflict detection, per-
+sonalized reminders, workload prediction and study plan generation, the system helps students
+manage their time more effectively and improve academic productivity.
+
+                                                        2
+

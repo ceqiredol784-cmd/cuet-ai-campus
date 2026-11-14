@@ -24,6 +24,7 @@ import chatRoutes from './routes/chat.routes.js';
 import routinePdfRoutes from './routes/routinePdf.routes.js';
 import calendarRoutes from './routes/calendar.routes.js';
 import overridesRoutes from './routes/overrides.routes.js';
+import routineProposalRoutes from './routes/routineProposal.routes.js';
 import attendanceRoutes from './routes/attendance.routes.js';
 
 const app = express();
@@ -82,6 +83,7 @@ app.use('/api/v1/chat', chatRoutes);
 app.use('/api/v1/routine-pdf', routinePdfRoutes);
 app.use('/api/v1/calendar', calendarRoutes);
 app.use('/api/v1/overrides', overridesRoutes);
+app.use('/api/v1/routine-proposals', routineProposalRoutes);
 app.use('/api/v1/attendance', attendanceRoutes);
 
 app.use(notFound);

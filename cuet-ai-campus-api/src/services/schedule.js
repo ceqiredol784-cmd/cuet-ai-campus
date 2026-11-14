@@ -17,7 +17,7 @@ import {
   sortRoutineEntries,
 } from './routineSerializer.js';
 
-const DAY_LEVEL_TYPES = ['auto_day_off', 'mid_break'];
+const DAY_LEVEL_TYPES = ['auto_day_off', 'mid_break', 'classes_end'];
 
 function plain(doc) {
   return typeof doc?.toObject === 'function' ? doc.toObject({ virtuals: true }) : { ...(doc || {}) };
@@ -78,6 +78,11 @@ export async function applicableOverrides(sectionId, date) {
         startDate: { $lte: date },
         endDate: { $gte: date },
       },
+      // Classes-end declarations run open-endedly from their start date.
+      {
+        type: 'classes_end',
+        startDate: { $lte: date },
+      },
     ],
   })
     .populate('courseId', 'code title credits')
@@ -102,11 +107,18 @@ export async function getDaySchedule({ date, sectionId }) {
   const [routine, overrides, exams] = await Promise.all([
     RoutineEntry.find({ sectionId, day }).populate(routinePopulate),
     applicableOverrides(sectionId, date),
-    Exam.find({ sectionId, examDate: date }).populate(examPopulate),
+    Exam.find({ sectionId, examDate: date, status: 'approved' }).populate(examPopulate),
   ]);
 
   const declaration = dayDeclarationFrom(overrides);
-  const dayStatus = declaration?.type === 'mid_break' ? 'mid_break' : declaration ? 'auto_day_off' : 'regular';
+  const dayStatus =
+    declaration?.type === 'mid_break'
+      ? 'mid_break'
+      : declaration?.type === 'classes_end'
+        ? 'classes_ended'
+        : declaration
+          ? 'auto_day_off'
+          : 'regular';
 
   let classes = [];
   if (!declaration) {
@@ -217,6 +229,9 @@ export async function getDayStatuses({ from, to, sectionId }) {
       if (override.type === 'mid_break') {
         return override.startDate <= date && override.endDate >= date;
       }
+      if (override.type === 'classes_end') {
+        return Boolean(override.startDate) && override.startDate <= date;
+      }
       return override.specificDate === date;
     });
     const declaration = applicable
@@ -235,6 +250,8 @@ export async function getDayStatuses({ from, to, sectionId }) {
         override.type === 'time_change'
       ) {
         marks.add('classChange');
+      } else if (override.type === 'classes_end') {
+        marks.add('classesEnd');
       }
     }
 
@@ -243,9 +260,11 @@ export async function getDayStatuses({ from, to, sectionId }) {
       status:
         declaration?.type === 'mid_break'
           ? 'mid_break'
-          : declaration
-            ? 'auto_day_off'
-            : 'regular',
+          : declaration?.type === 'classes_end'
+            ? 'classes_ended'
+            : declaration
+              ? 'auto_day_off'
+              : 'regular',
       declarationId: declaration ? idString(declaration._id) : null,
       marks: [...marks],
     };

@@ -9,6 +9,7 @@ import { CRAssignment, RoutinePdf, Section, User } from '../src/models/index.js'
 import { setupDatabase, teardownDatabase } from './helper.js';
 
 let crToken;
+let crId;
 let demoCrToken;
 let studentAToken;
 let coordinatorToken;
@@ -177,6 +178,8 @@ describe('CUET AI Campus API', () => {
 
     sectionBId = String(await createFixtureUsers(String(sectionAId)));
     crToken = await loginAs('u2204020@student.cuet.ac.bd');
+    const crProfile = await me(crToken);
+    crId = String(crProfile.id ?? crProfile._id);
   });
 
   after(async () => {
@@ -316,6 +319,389 @@ describe('CUET AI Campus API', () => {
     assert.strictEqual(cancelled.status, 'cancelled');
   });
 
+  it('shows a batch-wide day-off once in the CR\'s declaration list (no sibling-copy duplication)', async () => {
+    const { dateIso } = nextTeachingDate(3);
+
+    const created = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'auto_day_off', date: dateIso, reason: 'Batch-wide day off' })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(created.status, 201, JSON.stringify(created.body));
+    const dayOffSrcId = String(created.body.data.id ?? created.body.data._id);
+
+    // The CR's own declaration list must show the declaration ONCE — the
+    // batch-wide sibling copy (matched via declaredBy) must not duplicate it.
+    const crList = await request(app)
+      .get('/api/v1/overrides')
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(crList.status, 200);
+    const crOverrides = Array.isArray(crList.body) ? crList.body : crList.body.data;
+    const dayOffs = crOverrides.filter((o) => o.type === 'auto_day_off');
+    assert.strictEqual(
+      dayOffs.length,
+      1,
+      `day-off should appear once in the CR's list, got ${dayOffs.length}`
+    );
+
+    // The sibling section still has its own copy (batch-wide semantics).
+    const siblingList = await request(app)
+      .get('/api/v1/overrides')
+      .query({ sectionId: sectionAId })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(siblingList.status, 200);
+    const siblingOverrides = Array.isArray(siblingList.body)
+      ? siblingList.body
+      : siblingList.body.data;
+    assert.strictEqual(
+      siblingOverrides.filter((o) => o.type === 'auto_day_off').length,
+      1,
+      'the sibling section copy must exist for batch-wide calendars'
+    );
+
+    // A student in the sibling section sees their own section's copy.
+    const studentList = await request(app)
+      .get('/api/v1/overrides')
+      .set('Authorization', `Bearer ${studentAToken}`);
+    assert.strictEqual(studentList.status, 200);
+    const studentOverrides = Array.isArray(studentList.body)
+      ? studentList.body
+      : studentList.body.data;
+    assert.strictEqual(
+      studentOverrides.filter((o) => o.type === 'auto_day_off').length,
+      1
+    );
+
+    // The Updates feed must carry ONE notice for the declaration (the
+    // batch-scoped post), not one per section copy.
+    const feed = await request(app)
+      .get('/api/v1/updates?limit=50')
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(feed.status, 200);
+    const feedItems = feed.body.data?.items ?? [];
+    const dayOffNotices = feedItems.filter(
+      (u) =>
+        u.type === 'cancellation' &&
+        /Day off declared on/.test(u.title ?? '') &&
+        String(u.sourceOverrideId ?? '') === dayOffSrcId
+    );
+    assert.strictEqual(
+      dayOffNotices.length,
+      1,
+      `Updates feed should carry one day-off notice, got ${dayOffNotices.length}`
+    );
+
+    // Withdrawing the CR's own copy removes the whole batch-wide group.
+    const dayOffId = String(
+      dayOffs[0].id ?? dayOffs[0]._id ?? dayOffs[0]._id
+    );
+    const del = await request(app)
+      .delete(`/api/v1/overrides/${dayOffId}`)
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(del.status, 200);
+
+    const afterList = await request(app)
+      .get('/api/v1/overrides')
+      .query({ sectionId: sectionAId })
+      .set('Authorization', `Bearer ${crToken}`);
+    const after = Array.isArray(afterList.body) ? afterList.body : afterList.body.data;
+    assert.strictEqual(
+      after.filter((o) => o.type === 'auto_day_off').length,
+      0,
+      'withdrawing the CR\'s copy must remove the sibling copy too'
+    );
+  });
+
+  it('is idempotent: a retried identical day-off does not duplicate declaration or notice', async () => {
+    const { dateIso } = nextTeachingDate(4);
+
+    const first = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'auto_day_off', date: dateIso, reason: 'Retry guard' })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(first.status, 201, JSON.stringify(first.body));
+
+    // An outbox retry replays the identical payload — it must return the
+    // existing declaration, not create a second one (and a second notice).
+    const retry = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'auto_day_off', date: dateIso, reason: 'Retry guard' })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(retry.status, 200, JSON.stringify(retry.body));
+    assert.strictEqual(
+      String(retry.body.data.id),
+      String(first.body.data.id),
+      'the retry must return the original declaration'
+    );
+
+    const list = await request(app)
+      .get('/api/v1/overrides')
+      .set('Authorization', `Bearer ${crToken}`);
+    const overrides = Array.isArray(list.body) ? list.body : list.body.data;
+    const dayOffs = overrides.filter(
+      (o) => o.type === 'auto_day_off' && (o.specificDate === dateIso || o.startDate === dateIso)
+    );
+    assert.strictEqual(dayOffs.length, 1, 'no duplicate declaration');
+
+    const feed = await request(app)
+      .get('/api/v1/updates?limit=50')
+      .set('Authorization', `Bearer ${crToken}`);
+    const feedItems = feed.body.data?.items ?? [];
+    const notices = feedItems.filter(
+      (u) => u.type === 'cancellation' && String(u.sourceOverrideId ?? '') === String(first.body.data.id)
+    );
+    assert.strictEqual(notices.length, 1, 'no duplicate feed notice');
+
+    // A different date is a genuine new declaration, not a retry.
+    const other = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'auto_day_off', date: nextTeachingDate(5).dateIso })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(other.status, 201);
+
+    // Withdraw both (batch-wide groups).
+    for (const item of [first.body.data, other.body.data]) {
+      const del = await request(app)
+        .delete(`/api/v1/overrides/${item.id}`)
+        .set('Authorization', `Bearer ${crToken}`);
+      assert.strictEqual(del.status, 200);
+    }
+  });
+
+  it('declares classes-end (DL) batch-wide with exam-period day status', async () => {
+    const endDate = localIsoDate(new Date(Date.now() + 12 * 86400000));
+
+    const classesEnd = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'classes_end', date: endDate, reason: 'Final exam period' })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(classesEnd.status, 201, JSON.stringify(classesEnd.body));
+
+    // Batch-wide: the CR's own section AND the sibling section both show
+    // classes_ended from the end date on.
+    const dayOwn = await request(app)
+      .get('/api/v1/calendar/day')
+      .query({ date: endDate })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(dayOwn.status, 200);
+    assert.strictEqual(dayOwn.body.data.dayStatus, 'classes_ended');
+
+    const daySibling = await request(app)
+      .get('/api/v1/calendar/day')
+      .query({ date: endDate, sectionId: sectionAId })
+      .set('Authorization', `Bearer ${studentAToken}`);
+    assert.strictEqual(daySibling.status, 200);
+    assert.strictEqual(daySibling.body.data.dayStatus, 'classes_ended');
+
+    // last_class was removed — the API must reject it now.
+    const legacy = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'last_class', date: endDate })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(legacy.status, 400);
+  });
+
+  it('blocks declarations that conflict with existing day-level state', async () => {
+    // The DL from the previous test is live from +12 calendar days.
+    const dlStart = localIsoDate(new Date(Date.now() + 12 * 86400000));
+    const afterDl = localIsoDate(new Date(Date.now() + 15 * 86400000));
+    const weekly = await request(app)
+      .get('/api/v1/routine/weekly')
+      .query({ sectionId: sectionBId })
+      .set('Authorization', `Bearer ${crToken}`);
+    const courseId = weekly.body.data[0].courseId._id;
+
+    // 1. A day off after DL started is meaningless — classes are already over.
+    const inDl = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'auto_day_off', date: afterDl })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(inDl.status, 400, JSON.stringify(inDl.body));
+    assert.match(inDl.body.message, /DL has already started/);
+
+    // 2. Scheduling a class after DL started is equally contradictory.
+    const extraInDl = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'extra_class', date: afterDl, courseId, startTime: '16:00', endTime: '17:30' })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(extraInDl.status, 400, JSON.stringify(extraInDl.body));
+    assert.match(extraInDl.body.message, /DL has already started/);
+
+    // 3. A mid-break before the DL start, then an overlapping one.
+    const mbStart = localIsoDate(new Date(Date.now() + 5 * 86400000));
+    const mbEnd = localIsoDate(new Date(Date.now() + 7 * 86400000));
+    const mb = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'mid_break', startDate: mbStart, endDate: mbEnd })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(mb.status, 201, JSON.stringify(mb.body));
+
+    const overlap = await request(app)
+      .post('/api/v1/overrides')
+      .send({
+        type: 'mid_break',
+        startDate: mbEnd,
+        endDate: localIsoDate(new Date(Date.now() + 9 * 86400000)),
+      })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(overlap.status, 400, JSON.stringify(overlap.body));
+    assert.match(overlap.body.message, /overlaps an existing mid-break/);
+
+    // 4. A day off inside the mid-break is redundant.
+    const insideBreak = localIsoDate(new Date(Date.now() + 6 * 86400000));
+    const dayOffInBreak = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'auto_day_off', date: insideBreak })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(dayOffInBreak.status, 400, JSON.stringify(dayOffInBreak.body));
+    assert.match(dayOffInBreak.body.message, /Mid-break/);
+
+    // 5. A class inside the mid-break contradicts "no classes run that day".
+    const extraInBreak = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'extra_class', date: insideBreak, courseId, startTime: '16:00', endTime: '17:30' })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(extraInBreak.status, 400, JSON.stringify(extraInBreak.body));
+    assert.match(extraInBreak.body.message, /Mid-break/);
+
+    // 6. A second DL with a different date would leave two live DL marks.
+    const secondDl = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'classes_end', date: localIsoDate(new Date(Date.now() + 30 * 86400000)) })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(secondDl.status, 400, JSON.stringify(secondDl.body));
+    assert.match(secondDl.body.message, new RegExp(`DL is already declared from ${dlStart}`));
+
+    // Cleanup: withdraw the mid-break so later tests are unaffected.
+    const list = await request(app)
+      .get('/api/v1/overrides')
+      .set('Authorization', `Bearer ${crToken}`);
+    const overrides = Array.isArray(list.body) ? list.body : list.body.data;
+    const mbOverride = overrides.find((o) => o.type === 'mid_break' && o.startDate === mbStart);
+    assert.ok(mbOverride, 'mid-break should be listed for withdrawal');
+    const del = await request(app)
+      .delete(`/api/v1/overrides/${mbOverride.id ?? mbOverride._id}`)
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(del.status, 200);
+  });
+
+  it('keeps CR exam requests pending until a coordinator approves them', async () => {
+    const weekly = await request(app)
+      .get('/api/v1/routine/weekly')
+      .query({ sectionId: sectionBId })
+      .set('Authorization', `Bearer ${crToken}`);
+    const courseId = weekly.body.data[0].courseId._id;
+    const examDate = localIsoDate(new Date(Date.now() + 14 * 86400000));
+
+    const created = await request(app)
+      .post('/api/v1/exams')
+      .send({ courseId, sectionId: sectionBId, examType: 'final', examDate, startTime: '10:00', endTime: '12:00' })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(created.status, 201, JSON.stringify(created.body));
+    assert.strictEqual(created.body.data.status, 'pending');
+    const examId = String(created.body.data._id);
+
+    // An identical resubmit (builder retry after a partial failure) must
+    // return the existing exam, not create a second one.
+    const identicalRetry = await request(app)
+      .post('/api/v1/exams')
+      .send({ courseId, sectionId: sectionBId, examType: 'final', examDate, startTime: '10:00', endTime: '12:00' })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(identicalRetry.status, 200, JSON.stringify(identicalRetry.body));
+    assert.strictEqual(
+      String(identicalRetry.body.data._id),
+      examId,
+      'the identical resubmit must return the original exam'
+    );
+
+    // A second final within 7 days of the first must be rejected.
+    const tooClose = new Date(`${examDate}T12:00:00`);
+    tooClose.setDate(tooClose.getDate() + 3);
+    const closeAttempt = await request(app)
+      .post('/api/v1/exams')
+      .send({
+        courseId,
+        sectionId: sectionBId,
+        examType: 'final',
+        examDate: localIsoDate(tooClose),
+        startTime: '10:00',
+        endTime: '12:00',
+      })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(closeAttempt.status, 400, JSON.stringify(closeAttempt.body));
+
+    // The CR sees their own pending request in the section list.
+    const crList = await request(app)
+      .get('/api/v1/exams')
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.ok(
+      (crList.body.data?.items ?? []).some((e) => String(e._id) === examId),
+      'CR should see their pending exam request'
+    );
+
+    // Rejection works and the CR can revise and resubmit (back to pending).
+    const rejected = await request(app)
+      .put(`/api/v1/exams/${examId}/review`)
+      .send({ decision: 'rejected', note: 'Slot clashes with another section' })
+      .set('Authorization', `Bearer ${coordinatorToken}`);
+    assert.strictEqual(rejected.status, 200);
+    assert.strictEqual(rejected.body.data.status, 'rejected');
+
+    const revised = await request(app)
+      .put(`/api/v1/exams/${examId}`)
+      .send({ startTime: '11:00' })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(revised.status, 200);
+    assert.strictEqual(revised.body.data.status, 'pending');
+
+    // Approval publishes the exam and posts to the Updates feed.
+    const approved = await request(app)
+      .put(`/api/v1/exams/${examId}/review`)
+      .send({ decision: 'approved' })
+      .set('Authorization', `Bearer ${coordinatorToken}`);
+    assert.strictEqual(approved.status, 200);
+    assert.strictEqual(approved.body.data.status, 'approved');
+
+    const day = await request(app)
+      .get('/api/v1/calendar/day')
+      .query({ date: examDate })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.ok(
+      (day.body.data?.exams ?? []).some((e) => String(e._id ?? e.id) === examId),
+      'Approved exam should appear on the calendar day'
+    );
+
+    const feed = await request(app)
+      .get('/api/v1/updates?limit=20')
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.ok(
+      (feed.body.data?.items ?? []).some((u) => /exam on/.test(u.title ?? '')),
+      'Approval should create an Updates post'
+    );
+
+    // PUT enforces the same gap rule: moving this exam next to another
+    // section final must be rejected, excluding the exam itself.
+    const far = new Date(Date.now() + 40 * 86400000);
+    const farIso = localIsoDate(far);
+    const second = await request(app)
+      .post('/api/v1/exams')
+      .send({ courseId, sectionId: sectionBId, examType: 'final', examDate: farIso, startTime: '09:00', endTime: '10:00' })
+      .set('Authorization', `Bearer ${coordinatorToken}`);
+    assert.strictEqual(second.status, 201, JSON.stringify(second.body));
+
+    const near = new Date(`${farIso}T12:00:00`);
+    near.setDate(near.getDate() + 3);
+    const moveClose = await request(app)
+      .put(`/api/v1/exams/${examId}`)
+      .send({ examDate: localIsoDate(near) })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(moveClose.status, 400, JSON.stringify(moveClose.body));
+
+    const delSecond = await request(app)
+      .delete(`/api/v1/exams/${String(second.body.data._id)}`)
+      .set('Authorization', `Bearer ${coordinatorToken}`);
+    assert.strictEqual(delSecond.status, 200);
+  });
+
   it('does not leak Section B cancellation to Section A students', async () => {
     const res = await request(app)
       .get('/api/v1/calendar/day')
@@ -383,6 +769,82 @@ describe('CUET AI Campus API', () => {
     );
     assert.ok(extra, 'extra class should appear on the calendar');
     assert.strictEqual(extra.startTime, '16:30');
+
+    // Section-scoped: a regular make-up lecture must NOT leak to the sibling
+    // section of the same batch.
+    const siblingDay = await request(app)
+      .get('/api/v1/calendar/day')
+      .query({ date: dateIso, sectionId: sectionAId })
+      .set('Authorization', `Bearer ${studentAToken}`);
+    assert.strictEqual(siblingDay.status, 200);
+    const leaked = siblingDay.body.data.classes.find(
+      (c) => c.status === 'extra' && c.startTime === '16:30'
+    );
+    assert.ok(!leaked, 'a regular extra class must stay in the CR own section');
+  });
+
+  it('lets a CR aim an extra class at the sibling section explicitly', async () => {
+    const { dateIso, dayName } = nextTeachingDate(2);
+    // A CR can now READ the sibling section's routine to pick a class from it.
+    const weekly = await request(app)
+      .get('/api/v1/routine/weekly')
+      .query({ sectionId: sectionAId })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(weekly.status, 200);
+    const lectures = weekly.body.data.filter(
+      (e) => e.day === dayName && e.courseId?.code && e.courseId.code !== 'CT'
+    );
+    assert.ok(lectures.length > 0, `Section A should teach on ${dayName}`);
+
+    const res = await request(app)
+      .post('/api/v1/overrides')
+      .send({
+        type: 'extra_class',
+        date: dateIso,
+        sectionId: sectionAId,
+        courseId: lectures[0].courseId._id,
+        startTime: '17:30',
+        endTime: '18:20',
+        reason: 'Make-up lecture for Section A',
+      })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(res.status, 201, JSON.stringify(res.body));
+
+    // It lands on the aimed section's calendar…
+    const dayA = await request(app)
+      .get('/api/v1/calendar/day')
+      .query({ date: dateIso, sectionId: sectionAId })
+      .set('Authorization', `Bearer ${studentAToken}`);
+    assert.strictEqual(dayA.status, 200);
+    const onA = dayA.body.data.classes.find(
+      (c) => c.status === 'extra' && c.startTime === '17:30'
+    );
+    assert.ok(onA, 'the aimed extra class should appear on section A');
+
+    // …and NOT on the CR's own section.
+    const dayB = await request(app)
+      .get('/api/v1/calendar/day')
+      .query({ date: dateIso, sectionId: sectionBId })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(dayB.status, 200);
+    const onB = dayB.body.data.classes.find(
+      (c) => c.status === 'extra' && c.startTime === '17:30'
+    );
+    assert.ok(!onB, 'the aimed extra class must not appear on the CR own section');
+
+    // The CR's declaration list includes declarations made for the sibling.
+    const list = await request(app)
+      .get('/api/v1/overrides')
+      .set('Authorization', `Bearer ${crToken}`);
+    const entries = Array.isArray(list.body) ? list.body : list.body.data;
+    assert.ok(
+      entries.some(
+        (o) =>
+          o.type === 'extra_class' &&
+          String(o.sectionId?._id ?? o.sectionId) === String(sectionAId)
+      ),
+      'the CR should see their sibling-section declaration in the list'
+    );
   });
 
   it('rejects a CT declaration without a course', async () => {
@@ -467,6 +929,21 @@ describe('CUET AI Campus API', () => {
     assert.strictEqual(declared.startTime, ctDeclaredStart);
     assert.strictEqual(declared.endTime, ctDeclaredEnd);
     assert.strictEqual(String(declared.courseId?._id || declared.courseId), ctCourseId);
+
+    // Batch-wide: the same CT must also appear on the sibling section's
+    // calendar through its own override copy.
+    const siblingDay = await request(app)
+      .get('/api/v1/calendar/day')
+      .query({ date: ctDateIso, sectionId: sectionAId })
+      .set('Authorization', `Bearer ${studentAToken}`);
+    assert.strictEqual(siblingDay.status, 200);
+    const siblingCt = siblingDay.body.data.classes.find(
+      (c) =>
+        c.classType === 'ct' &&
+        c.status === 'extra' &&
+        String(c.courseId?._id || c.courseId) === ctCourseId
+    );
+    assert.ok(siblingCt, 'a declared CT should also appear on the sibling section calendar');
   });
 
   it('shifts a declared CT with time_change preserving the original time', async () => {
@@ -740,12 +1217,17 @@ describe('CUET AI Campus API', () => {
       ),
       'Section B CR should see Section B announcements / their batch CT'
     );
-    // …and Section A announcements are not.
+    // …and Section A announcements are not. The CR's own posts are always
+    // visible to them (feed rule: everyone sees their own posts), which
+    // includes declarations they aimed at the sibling section.
     assert.ok(
       !bItems.some(
-        (update) => update.scope === 'section' && sectionIdOfUpdate(update) === sectionAId
+        (update) =>
+          update.scope === 'section' &&
+          sectionIdOfUpdate(update) === sectionAId &&
+          String(update.authorId?._id ?? update.authorId) !== crId
       ),
-      'Section B CR must not receive Section A announcements'
+      'Section B CR must not receive Section A announcements from others'
     );
   });
 
@@ -868,13 +1350,33 @@ describe('CUET AI Campus API', () => {
       .set('Authorization', `Bearer ${studentAToken}`);
     assert.strictEqual(crossRead.status, 403);
 
-    const crossDelete = await request(app)
+    // A CR manages exams for their OWN section — deleting the section-B exam
+    // they can see must work, but a section-A exam must stay out of reach.
+    const ownDelete = await request(app)
       .delete(`/api/v1/exams/${examId}`)
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(ownDelete.status, 200);
+
+    const sectionAExam = await request(app)
+      .post('/api/v1/exams')
+      .send({
+        courseId,
+        sectionId: sectionAId,
+        examType: 'final',
+        examDate: '2026-12-06',
+        startTime: '09:00',
+        endTime: '10:00',
+      })
+      .set('Authorization', `Bearer ${coordinatorToken}`);
+    assert.strictEqual(sectionAExam.status, 201, JSON.stringify(sectionAExam.body));
+
+    const crossDelete = await request(app)
+      .delete(`/api/v1/exams/${String(sectionAExam.body.data._id)}`)
       .set('Authorization', `Bearer ${crToken}`);
     assert.strictEqual(crossDelete.status, 403);
 
     const removed = await request(app)
-      .delete(`/api/v1/exams/${examId}`)
+      .delete(`/api/v1/exams/${String(sectionAExam.body.data._id)}`)
       .set('Authorization', `Bearer ${coordinatorToken}`);
     assert.strictEqual(removed.status, 200);
   });
@@ -1175,5 +1677,234 @@ describe('CUET AI Campus API', () => {
     assert.ok(periods.every((period) => period > 0));
 
     await RoutinePdf.findByIdAndDelete(pdf._id);
+  });
+
+  it('declares a mid-break batch-wide across sibling sections', async () => {
+    const mbStart = localIsoDate(new Date(Date.now() + 5 * 86400000));
+    const mbEnd = localIsoDate(new Date(Date.now() + 7 * 86400000));
+    const res = await request(app)
+      .post('/api/v1/overrides')
+      .send({ type: 'mid_break', startDate: mbStart, endDate: mbEnd })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(res.status, 201, JSON.stringify(res.body));
+    assert.strictEqual(res.body.data.message, 'Declaration submitted');
+
+    // CR sees exactly one own-section copy carrying a groupId.
+    const listA = await request(app)
+      .get('/api/v1/overrides')
+      .set('Authorization', `Bearer ${crToken}`);
+    const itemsA = Array.isArray(listA.body) ? listA.body : listA.body.data;
+    const copiesA = itemsA.filter((o) => o.type === 'mid_break' && o.startDate === mbStart);
+    assert.strictEqual(copiesA.length, 1, 'CR sees exactly one own-section copy');
+    assert.ok(copiesA[0].groupId, 'mid-break copy carries a groupId');
+
+    // One batch-scoped feed post, visible to a student of the batch.
+    const feed = await request(app)
+      .get('/api/v1/updates?limit=50')
+      .set('Authorization', `Bearer ${studentAToken}`);
+    assert.strictEqual(feed.status, 200);
+    const feedItems = feed.body.data?.items ?? [];
+    const matching = feedItems.filter(
+      (u) => u.sourceOverrideId && u.sourceOverrideId === copiesA[0].id
+    );
+    assert.strictEqual(matching.length, 1, 'exactly one mid-break feed post');
+
+    // Withdrawing removes every sibling copy and the feed post.
+    const del = await request(app)
+      .delete(`/api/v1/overrides/${copiesA[0].id}`)
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(del.status, 200);
+    const listB = await request(app)
+      .get('/api/v1/overrides')
+      .set('Authorization', `Bearer ${crToken}`);
+    const itemsB = Array.isArray(listB.body) ? listB.body : listB.body.data;
+    assert.strictEqual(
+      itemsB.filter((o) => o.type === 'mid_break' && o.startDate === mbStart).length,
+      0,
+      'withdraw removes the batch-wide group'
+    );
+  });
+
+  it('runs the full weekly routine proposal flow: submit, review, publish', async () => {
+    // Manual, period-based entries — the official 9-period day.
+    const threeEntries = [
+      {
+        day: 'Sunday',
+        period: 1,
+        courseCode: 'CSE-101',
+        courseTitle: 'Introduction to Programming',
+        teachers: ['Dr. Ada Lovelace', 'Mr. Alan Turing'],
+        room: 'R-101',
+      },
+      {
+        day: 'Sunday',
+        period: 2,
+        courseCode: 'MAT-101',
+        courseTitle: 'Linear Algebra',
+        teachers: ['Prof. Gauss'],
+      },
+      {
+        day: 'Monday',
+        period: 7,
+        periodEnd: 8,
+        courseCode: 'CSE-102',
+        courseTitle: 'Structured Programming Lab',
+        teachers: ['Dr. Hopper'],
+        classType: 'lab',
+      },
+    ];
+
+    // 1. CR submits a full weekly routine for coordinator review.
+    const submit = await request(app)
+      .post('/api/v1/routine-proposals')
+      .send({ entries: threeEntries })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(submit.status, 201, JSON.stringify(submit.body));
+    assert.strictEqual(submit.body.data.status, 'pending');
+    assert.strictEqual(submit.body.data.entryCount, 3);
+    const proposalId = submit.body.data.id;
+
+    // 2. Resubmitting replaces the pending proposal instead of duplicating.
+    const resubmit = await request(app)
+      .post('/api/v1/routine-proposals')
+      .send({ entries: [threeEntries[0]] })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(resubmit.status, 201);
+    assert.strictEqual(resubmit.body.data.id, proposalId, 'resubmit replaces the pending proposal');
+
+    // 3. CR edits the pending proposal directly.
+    const edit = await request(app)
+      .put(`/api/v1/routine-proposals/${proposalId}`)
+      .send({ entries: threeEntries })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(edit.status, 200, JSON.stringify(edit.body));
+    assert.strictEqual(edit.body.data.entryCount, 3);
+
+    // 4. A CR of a sibling section in the SAME batch can view (and manage)
+    // the proposal — the CR team builds both sections' routines.
+    const sibling = await request(app)
+      .get(`/api/v1/routine-proposals/${proposalId}`)
+      .set('Authorization', `Bearer ${demoCrToken}`);
+    assert.strictEqual(sibling.status, 200, JSON.stringify(sibling.body));
+    assert.strictEqual(sibling.body.data.sectionId.id ?? sibling.body.data.sectionId._id, String(sectionBId));
+
+    // 5. Coordinator approves — the routine is published for the section.
+    const review = await request(app)
+      .put(`/api/v1/routine-proposals/${proposalId}/review`)
+      .send({ decision: 'approved' })
+      .set('Authorization', `Bearer ${coordinatorToken}`);
+    assert.strictEqual(review.status, 200, JSON.stringify(review.body));
+    assert.strictEqual(review.body.data.status, 'approved');
+
+    // 6. The published weekly routine now matches the proposal exactly —
+    // the 2-period lab becomes one entry per period (4 entries total).
+    const weekly = await request(app)
+      .get('/api/v1/routine/weekly')
+      .query({ sectionId: sectionBId })
+      .set('Authorization', `Bearer ${coordinatorToken}`);
+    assert.strictEqual(weekly.status, 200);
+    const entries = weekly.body.data;
+    assert.strictEqual(entries.length, 4, 'routine replaced by the proposal entries');
+    const sundayFirst = entries.find((e) => e.day === 'Sunday' && e.period === 1);
+    assert.ok(sundayFirst, 'Sunday period 1 entry exists');
+    assert.strictEqual(sundayFirst.course.code, 'CSE-101');
+    assert.strictEqual(sundayFirst.startTime, '08:10');
+    assert.deepStrictEqual(sundayFirst.instructor, ['Dr. Ada Lovelace', 'Mr. Alan Turing']);
+    const mondayLab = entries.filter((e) => e.day === 'Monday');
+    assert.strictEqual(mondayLab.length, 2, 'the lab spans periods 7 and 8');
+    assert.ok(mondayLab.every((e) => e.classType === 'lab'));
+    assert.strictEqual(mondayLab[0].startTime, '13:45');
+    assert.strictEqual(mondayLab[1].endTime, '15:15');
+
+    // 7. The CR can edit the published routine directly — no coordinator
+    // approval needed for follow-up changes.
+    const crEdit = await request(app)
+      .put(`/api/v1/routine/${sundayFirst.id}`)
+      .send({ room: 'R-999', teacherNames: ['Dr. Ada Lovelace', 'Ms. Grace Hopper'] })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(crEdit.status, 200, JSON.stringify(crEdit.body));
+    assert.strictEqual(crEdit.body.data.room, 'R-999');
+    assert.deepStrictEqual(crEdit.body.data.instructor, [
+      'Dr. Ada Lovelace',
+      'Ms. Grace Hopper',
+    ]);
+
+    // 8. A second proposal can be rejected with a note.
+    const second = await request(app)
+      .post('/api/v1/routine-proposals')
+      .send({
+        entries: [
+          {
+            day: 'Tuesday',
+            period: 1,
+            courseCode: 'CSE-103',
+            courseTitle: 'Discrete Math',
+            teachers: ['Prof. Cantor'],
+          },
+        ],
+      })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(second.status, 201);
+    const reject = await request(app)
+      .put(`/api/v1/routine-proposals/${second.body.data.id}/review`)
+      .send({ decision: 'rejected', note: 'Please include the lab sessions too' })
+      .set('Authorization', `Bearer ${coordinatorToken}`);
+    assert.strictEqual(reject.status, 200);
+
+    // 9. The sibling CR (Section A) can submit a proposal FOR Section B by
+    // naming it — same batch, so it is allowed.
+    const forSibling = await request(app)
+      .post('/api/v1/routine-proposals')
+      .send({
+        sectionId: sectionBId,
+        entries: [
+          {
+            day: 'Wednesday',
+            period: 2,
+            courseCode: 'CSE-104',
+            courseTitle: 'Sibling Section Check',
+            teachers: ['Prof. Sibling'],
+          },
+        ],
+      })
+      .set('Authorization', `Bearer ${demoCrToken}`);
+    assert.strictEqual(forSibling.status, 201, JSON.stringify(forSibling.body));
+    assert.strictEqual(
+      String(forSibling.body.data.sectionId.id ?? forSibling.body.data.sectionId._id),
+      String(sectionBId),
+      'the proposal targets Section B'
+    );
+    const withdrawSibling = await request(app)
+      .delete(`/api/v1/routine-proposals/${forSibling.body.data.id}`)
+      .set('Authorization', `Bearer ${demoCrToken}`);
+    assert.strictEqual(withdrawSibling.status, 200);
+    assert.strictEqual(reject.body.data.status, 'rejected');
+    assert.strictEqual(reject.body.data.reviewNote, 'Please include the lab sessions too');
+
+    // 9. An approved proposal cannot be edited again.
+    const editApproved = await request(app)
+      .put(`/api/v1/routine-proposals/${proposalId}`)
+      .send({ entries: [] })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(editApproved.status, 400);
+
+    // 10. A class can never span the Break (P3→P4) or Lunch (P6→P7) gaps.
+    const spanBreak = await request(app)
+      .post('/api/v1/routine-proposals')
+      .send({
+        entries: [
+          {
+            day: 'Wednesday',
+            period: 3,
+            periodEnd: 4,
+            courseCode: 'CSE-104',
+            courseTitle: 'Operating Systems',
+            teachers: ['Prof. Tanenbaum'],
+          },
+        ],
+      })
+      .set('Authorization', `Bearer ${crToken}`);
+    assert.strictEqual(spanBreak.status, 400, JSON.stringify(spanBreak.body));
+    assert.match(spanBreak.body.message, /cannot span Break or Lunch/);
   });
 });

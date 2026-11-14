@@ -1,6 +1,6 @@
 import express from 'express';
 import { protect, requireCr } from '../middleware/auth.js';
-import { updateUpload } from '../middleware/upload.js';
+import { updateUpload, relativeUploadPath } from '../middleware/upload.js';
 import * as updatesService from '../services/updates.js';
 import { Update } from '../models/index.js';
 import { asyncHandler, sendData } from '../utils/http.js';
@@ -57,14 +57,15 @@ router.post(
       payload = { ...req.body };
     }
 
-    const attachmentUrls = files.map((file) => ({
-      url: `${req.protocol}://${req.get('host')}/uploads/updates/${file.filename}`,
-      name: file.originalname,
-    }));
+    // Store host-independent relative paths — the client resolves them
+    // against the API origin, so links survive host/port changes.
+    const attachmentUrls = files.map((file) => relativeUploadPath(file, 'updates'));
     const attachments =
-      Array.isArray(payload.attachments) && payload.attachments.length > 0
-        ? payload.attachments
-        : attachmentUrls;
+      files.length > 0
+        ? attachmentUrls
+        : Array.isArray(payload.attachments)
+          ? payload.attachments
+          : [];
 
     const update = await updatesService.createUpdate({
       user: req.user,

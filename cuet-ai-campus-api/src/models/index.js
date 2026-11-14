@@ -8,7 +8,7 @@ export {
   Teacher,
   Term,
 } from './Academic.js';
-export { RoutineEntry } from './Routine.js';
+export { RoutineEntry, RoutineProposal } from './Routine.js';
 export { Update } from './Update.js';
 export { Assignment, Attendance, Exam, StudyMaterial } from './StudentContent.js';
 export { RoutinePdf, ScheduleOverride } from './Schedule.js';

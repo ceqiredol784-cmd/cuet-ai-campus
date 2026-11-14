@@ -240,7 +240,7 @@ export async function createUpdate({ user, body, files = [], req = null }) {
     eventLocation: eventFields.eventLocation,
     status: 'approved',
     attachments: Array.isArray(files) && files.length
-      ? files.map((f) => f.url)
+      ? files.map((f) => (typeof f === 'string' ? f : f.url))
       : Array.isArray(body.attachments)
         ? body.attachments
         : [],

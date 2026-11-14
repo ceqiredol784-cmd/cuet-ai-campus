@@ -19,6 +19,38 @@ router.use(protect);
  * other devices would only see the change if they opened the calendar on the
  * exact date — the feed would stay silent.
  */
+/**
+ * Ensure every sibling section of the batch has its copy of a batch-wide
+ * declaration (an earlier partial sync may have created only the CR's own
+ * copy before the response was lost). Idempotent — creates only what's
+ * missing, keyed by the declaration's groupId.
+ */
+async function ensureBatchWideSiblings(ownCopy, basePayload, extra) {
+  if (!ownCopy?.groupId) return;
+  const ownSection = await Section.findById(idOf(ownCopy.sectionId)).select('batchId');
+  if (!ownSection?.batchId) return;
+  const siblings = await Section.find({
+    batchId: ownSection.batchId,
+    _id: { $ne: idOf(ownCopy.sectionId) },
+  }).select('_id');
+  for (const section of siblings) {
+    // eslint-disable-next-line no-await-in-loop
+    const exists = await ScheduleOverride.findOne({
+      groupId: ownCopy.groupId,
+      sectionId: section._id,
+    });
+    if (!exists) {
+      // eslint-disable-next-line no-await-in-loop
+      await ScheduleOverride.create({
+        ...basePayload,
+        sectionId: section._id,
+        ...extra,
+        groupId: ownCopy.groupId,
+      });
+    }
+  }
+}
+
 function overrideFeedContent(override) {
   const course =
     override.courseId && typeof override.courseId === 'object'
@@ -49,6 +81,15 @@ function overrideFeedContent(override) {
         priority: 'important',
         title: `Mid-break declared ${override.startDate} → ${override.endDate}`,
         description: override.reason || 'Classes are suspended for the mid-break.',
+      };
+    case 'classes_end':
+      return {
+        type: 'cancellation',
+        priority: 'important',
+        title: `DL starts from ${override.startDate}`,
+        description:
+          override.reason ||
+          'Classes are over — duration leave (DL) for exam preparation begins.',
       };
     case 'class_cancellation':
       return {
@@ -167,18 +208,116 @@ router.get(
     if (req.query.sectionId) filter.sectionId = req.query.sectionId;
     if (req.query.status) filter.status = req.query.status;
 
-    // CRs see their own overrides unless an admin/coordinator asks for another section.
+    // CRs see their own section plus every declaration they made (a CR may
+    // aim a declaration at a sibling section of the same batch).
+    let ownSectionId = null;
+    let dedupeBatchGroups = false;
     if (!req.user.roles.includes('admin') && !req.user.roles.includes('coordinator')) {
-      filter.sectionId = idOf(req.user.sectionId);
+      ownSectionId = idOf(req.user.sectionId);
+      if (req.user.roles.includes('cr')) {
+        filter.$or = [{ sectionId: ownSectionId }, { declaredBy: req.user._id }];
+        // Batch-wide declarations (day off, DL) are copied to every sibling
+        // section. The $or above matches the CR's own copy AND the sibling
+        // copies they declared — without dedupe one declaration would show
+        // twice in their list and double-count in the statistics.
+        dedupeBatchGroups = true;
+      } else {
+        filter.sectionId = ownSectionId;
+      }
     }
 
     const overrides = await ScheduleOverride.find(filter)
       .populate(overridePopulate)
       .sort({ createdAt: -1 });
 
-    sendData(res, overrides);
+    let visible = overrides;
+    if (dedupeBatchGroups) {
+      // One batch-wide declaration creates one copy per section; the $or
+      // above matches the CR's own copy AND the sibling copies they declared
+      // (declaredBy). Dedupe by groupId so one declaration = one list entry,
+      // preferring the CR's own-section copy.
+      const byGroup = new Map();
+      const deduped = [];
+      for (const doc of overrides) {
+        const gid = doc.groupId ? String(doc.groupId) : null;
+        if (!gid) {
+          deduped.push(doc);
+          continue;
+        }
+        const existing = byGroup.get(gid);
+        if (!existing) {
+          byGroup.set(gid, doc);
+          deduped.push(doc);
+          continue;
+        }
+        const isOwnCopy = String(idOf(doc.sectionId)) === String(ownSectionId);
+        const existingIsOwn =
+          String(idOf(existing.sectionId)) === String(ownSectionId);
+        if (isOwnCopy && !existingIsOwn) {
+          deduped[deduped.indexOf(existing)] = doc;
+          byGroup.set(gid, doc);
+        }
+      }
+      visible = deduped;
+    }
+
+    sendData(res, visible);
   })
 );
+
+/**
+ * Find an existing approved day-level declaration that conflicts with a new
+ * declaration for the given date/range in the target section. Day-level
+ * declarations are batch-wide (one copy per section), so the target section's
+ * copies are authoritative for "what is already declared on that day".
+ */
+async function findDayConflict(sectionId, { date = null, startDate = null, endDate = null } = {}) {
+  const from = startDate ?? date;
+  const to = endDate ?? date;
+  if (!from) return null;
+  const dayLevel = await ScheduleOverride.find({
+    sectionId,
+    status: 'approved',
+    type: { $in: ['auto_day_off', 'mid_break', 'classes_end'] },
+  }).lean();
+  for (const override of dayLevel) {
+    if (override.type === 'auto_day_off') {
+      const d = override.specificDate;
+      if (d && d >= from && d <= to) return override;
+    } else if (override.type === 'mid_break') {
+      const s = override.startDate;
+      const e = override.endDate;
+      if (s && e && s <= to && e >= from) return override;
+    } else if (override.type === 'classes_end') {
+      // DL is open-ended from its start date — everything on/after it is
+      // already "no classes".
+      if (override.startDate && override.startDate <= from) return override;
+    }
+  }
+  return null;
+}
+
+/** Human-readable conflict message for a day-level clash. */
+function dayConflictMessage(conflict, date) {
+  if (conflict.type === 'mid_break') {
+    return `Mid-break (${conflict.startDate} → ${conflict.endDate}) already covers ${date} — withdraw it before declaring a day off there`;
+  }
+  if (conflict.type === 'classes_end') {
+    return `DL has already started (${conflict.startDate}) — classes are over, a day off can't be declared`;
+  }
+  return `A day off is already declared for ${conflict.specificDate} — withdraw it before declaring again`;
+}
+
+/** Conflict message for scheduling a class (extra class / change) on a day. */
+function classConflictMessage(conflict, date) {
+  if (conflict.type === 'mid_break') {
+    return `Mid-break (${conflict.startDate} → ${conflict.endDate}) covers ${date} — no classes run that day`;
+  }
+  if (conflict.type === 'classes_end') {
+    return `DL has already started (${conflict.startDate}) — classes are over`;
+  }
+  return `${date} is already declared as a day off — withdraw that declaration before scheduling a class`;
+}
 
 router.post(
   '/',
@@ -192,8 +331,27 @@ router.post(
     const now = new Date();
     const sectionId = idOf(user.sectionId);
 
+    // Optional target section: a CR may aim a declaration at a sibling
+    // section of the same batch (e.g. a make-up class for the other section).
+    // Anything outside their own batch is rejected.
+    let targetSectionId = sectionId;
+    if (body.sectionId && mongoose.isValidObjectId(String(body.sectionId))) {
+      if (String(idOf(body.sectionId)) !== sectionId) {
+        const requested = await Section.findById(body.sectionId).select('batchId');
+        const ownSectionDoc = await Section.findById(sectionId).select('batchId');
+        const sameBatch =
+          requested?.batchId &&
+          ownSectionDoc?.batchId &&
+          String(idOf(requested.batchId)) === String(idOf(ownSectionDoc.batchId));
+        if (!sameBatch) {
+          throw new AppError(403, 'You can only declare for sections in your own batch');
+        }
+        targetSectionId = idOf(requested._id);
+      }
+    }
+
     const basePayload = {
-      sectionId,
+      sectionId: targetSectionId,
       declaredBy: user._id,
       status: 'approved',
       type,
@@ -207,7 +365,41 @@ router.post(
     if (type === 'auto_day_off') {
       const date = normalizeDate(body.date);
       if (!date) throw new AppError(400, 'A valid date (YYYY-MM-DD) is required');
+      // Idempotent: an outbox retry after a lost response must not create a
+      // second declaration (and a second feed notice) for the same day.
+      const dupe = await ScheduleOverride.findOne({
+        sectionId: targetSectionId,
+        type,
+        specificDate: date,
+        status: 'approved',
+      });
+      if (dupe) {
+        await ensureBatchWideSiblings(dupe, basePayload, {
+          specificDate: date,
+          startDate: date,
+          endDate: date,
+        });
+        const linked = await Update.findOne({ sourceOverrideId: dupe._id });
+        return sendData(
+          res,
+          {
+            id: String(dupe._id),
+            _id: String(dupe._id),
+            updateId: linked ? String(linked._id) : null,
+            groupId: dupe.groupId ?? null,
+            message: 'Declaration already exists',
+          },
+          200
+        );
+      }
       const groupId = randomUUID();
+      // A day off can't be declared inside an existing mid-break or after DL
+      // has started — the day is already class-free.
+      const dayConflict = await findDayConflict(targetSectionId, { date });
+      if (dayConflict) {
+        throw new AppError(400, dayConflictMessage(dayConflict, date));
+      }
+
       override = new ScheduleOverride({
         ...basePayload,
         specificDate: date,
@@ -243,11 +435,147 @@ router.post(
       if (!startDate || !endDate || endDate < startDate) {
         throw new AppError(400, 'Valid mid-break date range is required');
       }
+      // Idempotent: a retried identical mid-break must not duplicate.
+      const dupe = await ScheduleOverride.findOne({
+        sectionId: targetSectionId,
+        type,
+        startDate,
+        endDate,
+        status: 'approved',
+      });
+      if (dupe) {
+        await ensureBatchWideSiblings(dupe, basePayload, {
+          specificDate: null,
+          startDate,
+          endDate,
+        });
+        const linked = await Update.findOne({ sourceOverrideId: dupe._id });
+        return sendData(
+          res,
+          {
+            id: String(dupe._id),
+            _id: String(dupe._id),
+            updateId: linked ? String(linked._id) : null,
+            groupId: dupe.groupId ?? null,
+            message: 'Declaration already exists',
+          },
+          200
+        );
+      }
+      // A mid-break can't overlap another mid-break, swallow an existing day
+      // off, or start after DL has begun.
+      const breakConflict = await findDayConflict(targetSectionId, { startDate, endDate });
+      if (breakConflict) {
+        if (breakConflict.type === 'auto_day_off') {
+          throw new AppError(
+            400,
+            `A day off is already declared on ${breakConflict.specificDate} — withdraw it before declaring a mid-break covering it`
+          );
+        }
+        if (breakConflict.type === 'mid_break') {
+          throw new AppError(
+            400,
+            `This range overlaps an existing mid-break (${breakConflict.startDate} → ${breakConflict.endDate}) — withdraw it first`
+          );
+        }
+        throw new AppError(
+          400,
+          `DL has already started (${breakConflict.startDate}) — a mid-break can't be declared after classes end`
+        );
+      }
+      // A mid-break pauses the whole batch's classes, so it is declared
+      // batch-wide: one copy per sibling section, all sharing a groupId.
+      const groupId = randomUUID();
       override = new ScheduleOverride({
         ...basePayload,
         startDate,
         endDate,
+        groupId,
       });
+
+      const ownSection = await Section.findById(sectionId).select('batchId');
+      const siblingSections = ownSection?.batchId
+        ? await Section.find({
+            batchId: ownSection.batchId,
+            _id: { $ne: sectionId },
+          }).select('_id')
+        : [];
+      siblingsAdditional = siblingSections.map(
+        (section) =>
+          new ScheduleOverride({
+            ...basePayload,
+            startDate,
+            endDate,
+            groupId,
+            sectionId: section._id,
+          })
+      );
+    } else if (type === 'classes_end') {
+      // DL (duration leave): regular classes stop from the declared date and
+      // exam preparation begins. Batch-wide — every section finishes together.
+      const date = normalizeDate(body.date);
+      if (!date) throw new AppError(400, 'A valid date (YYYY-MM-DD) is required');
+      // Idempotent: a retried identical DL declaration must not duplicate.
+      const dupe = await ScheduleOverride.findOne({
+        sectionId: targetSectionId,
+        type,
+        startDate: date,
+        status: 'approved',
+      });
+      if (dupe) {
+        await ensureBatchWideSiblings(dupe, basePayload, {
+          specificDate: null,
+          startDate: date,
+          endDate: null,
+        });
+        const linked = await Update.findOne({ sourceOverrideId: dupe._id });
+        return sendData(
+          res,
+          {
+            id: String(dupe._id),
+            _id: String(dupe._id),
+            updateId: linked ? String(linked._id) : null,
+            groupId: dupe.groupId ?? null,
+            message: 'Declaration already exists',
+          },
+          200
+        );
+      }
+      const groupId = randomUUID();
+      // Only one live DL declaration: a second one with a different start
+      // date would leave two conflicting "classes are over" marks. The CR's
+      // replace flow withdraws the previous one first.
+      const otherDl = await ScheduleOverride.findOne({
+        sectionId: targetSectionId,
+        type: 'classes_end',
+        status: 'approved',
+        startDate: { $ne: date },
+      });
+      if (otherDl) {
+        throw new AppError(
+          400,
+          `DL is already declared from ${otherDl.startDate} — withdraw it before declaring a new date`
+        );
+      }
+      const wrapPayload = { specificDate: null, startDate: date, endDate: null };
+      override = new ScheduleOverride({ ...basePayload, ...wrapPayload, groupId });
+
+      const ownSection = await Section.findById(sectionId).select('batchId');
+      const siblingSections = ownSection?.batchId
+        ? await Section.find({
+            batchId: ownSection.batchId,
+            _id: { $ne: sectionId },
+          }).select('_id')
+        : [];
+      siblingsAdditional = siblingSections.map(
+        (section) =>
+          new ScheduleOverride({
+            ...basePayload,
+            ...wrapPayload,
+            groupId,
+            sectionId: section._id,
+          })
+      );
     } else if (
       type === 'class_cancellation' ||
       type === 'room_change' ||
@@ -266,12 +594,46 @@ router.post(
       if (type === 'room_change' && !String(body.room || '').trim()) {
         throw new AppError(400, 'A new room is required');
       }
+      // A class change is meaningless on a day that is already class-free
+      // (day off / mid-break / after DL) — there is no class to change.
+      const changeDayConflict = await findDayConflict(targetSectionId, { date });
+      if (changeDayConflict) {
+        throw new AppError(400, classConflictMessage(changeDayConflict, date));
+      }
       let entry = null;
       let originalValues;
       let courseId;
       // When the change targets a batch-shared CT, the same change is applied
       // to every section copy so the batch stays consistent.
       let targetGroupCopies = null;
+
+      // Idempotent: a retried identical change (same entry, date and values)
+      // must not create a second override. A genuine second change differs
+      // in room/time, so it still goes through.
+      const changeDupe = await ScheduleOverride.findOne({
+        sectionId: targetSectionId,
+        type,
+        specificDate: date,
+        status: 'approved',
+        ...(body.routineEntryId ? { routineEntryId: body.routineEntryId } : {}),
+        ...(type === 'room_change' && body.room ? { room: body.room } : {}),
+        ...(type === 'time_change'
+          ? { startTime: body.startTime, endTime: body.endTime }
+          : {}),
+      });
+      if (changeDupe) {
+        const linked = await Update.findOne({ sourceOverrideId: changeDupe._id });
+        return sendData(
+          res,
+          {
+            id: String(changeDupe._id),
+            _id: String(changeDupe._id),
+            updateId: linked ? String(linked._id) : null,
+            message: 'Declaration already exists',
+          },
+          200
+        );
+      }
 
       // The target may be a routine entry or an already-declared override
       // (extra class / class test id created by a CR declaration).
@@ -281,7 +643,7 @@ router.post(
         }
         entry = await RoutineEntry.findById(body.routineEntryId);
         if (entry) {
-          if (String(entry.sectionId) !== String(sectionId)) {
+          if (String(entry.sectionId) !== String(targetSectionId)) {
             throw new AppError(403, 'You cannot override classes in another section');
           }
           originalValues = {
@@ -293,13 +655,13 @@ router.post(
         } else {
           const declared = await ScheduleOverride.findOne({
             _id: body.routineEntryId,
-            sectionId,
+            sectionId: targetSectionId,
             type: 'extra_class',
           });
           if (!declared) {
             throw new AppError(404, 'Routine entry not found');
           }
-          if (String(declared.sectionId) !== String(sectionId)) {
+          if (String(declared.sectionId) !== String(targetSectionId)) {
             throw new AppError(403, 'You cannot override classes in another section');
           }
           originalValues = {
@@ -340,6 +702,13 @@ router.post(
     } else if (type === 'extra_class') {
       const date = normalizeDate(body.date);
       if (!date) throw new AppError(400, 'A valid date (YYYY-MM-DD) is required');
+      // A class can't be scheduled on a day that is already class-free
+      // (day off / mid-break / after DL) — the calendar would contradict
+      // itself.
+      const classDayConflict = await findDayConflict(targetSectionId, { date });
+      if (classDayConflict) {
+        throw new AppError(400, classConflictMessage(classDayConflict, date));
+      }
       const classType = body.classType === 'ct' ? 'ct' : 'lecture';
 
       let startTime = body.startTime || null;
@@ -372,13 +741,17 @@ router.post(
 
       // A declared class test applies to the whole batch, not just the CR's
       // own section: one copy per sibling section keeps every calendar in the
-      // batch correct (each section sees it through its own override).
-      const ownSectionDoc = await Section.findById(sectionId);
-      const batchId = idOf(ownSectionDoc?.batchId) || idOf(user.batchId);
-      const targetSections = batchId
+      // batch correct (each section sees it through its own override). A
+      // regular make-up class stays scoped to the CR's own section.
+      const batchWide = classType === 'ct';
+      const ownSectionDoc = await Section.findById(targetSectionId);
+      const batchId = batchWide
+        ? idOf(ownSectionDoc?.batchId) || idOf(user.batchId)
+        : null;
+      const targetSections = batchWide && batchId
         ? await Section.find({ batchId }).select('_id').sort({ name: 1 })
         : [];
-      if (targetSections.length === 0) targetSections.push({ _id: sectionId });
+      if (targetSections.length === 0) targetSections.push({ _id: targetSectionId });
 
       const groupId = randomUUID();
       const created = [];
@@ -389,7 +762,7 @@ router.post(
         const dupe = await ScheduleOverride.findOne({
           sectionId: section._id,
           type: 'extra_class',
-          classType: 'ct',
+          classType,
           specificDate: date,
           courseId: body.courseId || null,
           startTime,
@@ -418,6 +791,33 @@ router.post(
 
       const ownOverride =
         created.find((doc) => String(idOf(doc.sectionId)) === String(sectionId)) ?? created[0];
+
+      if (!batchWide) {
+        // Section-scoped make-up class: mirror the post into the CR's own
+        // section feed exactly like the other declaration types.
+        const populatedOwn = await ScheduleOverride.findById(ownOverride._id).populate(
+          overridePopulate
+        );
+        const linkedUpdate = await createLinkedUpdate(populatedOwn, user);
+        await logAudit({
+          action: 'override_created',
+          user,
+          sectionId,
+          targetId: ownOverride._id,
+          details: `${type} for ${date} — section-scoped`,
+          req,
+        });
+        return sendData(
+          res,
+          {
+            id: String(ownOverride._id),
+            _id: String(ownOverride._id),
+            updateId: String(linkedUpdate._id),
+            message: 'Declaration submitted',
+          },
+          201
+        );
+      }
 
       // ONE feed post scoped to the batch so every account — both sections —
       // sees the CT in Updates. Per-section posts would show duplicates to
