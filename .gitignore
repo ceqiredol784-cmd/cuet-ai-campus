@@ -1,4 +1,5 @@
 /*
 !.gitignore
+!render.yaml
 !/cuet-ai-campus-api/
 !/cuet-ai-campus-web/
