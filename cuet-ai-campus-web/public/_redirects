@@ -1,0 +1,3 @@
+# SPA fallback — send every unknown path to the React app so deep links
+# like /ai-settings or /login work on a hard refresh (Render static sites).
+/*    /index.html    200

@@ -2,7 +2,7 @@ import express from 'express';
 import { isCoordinator, protect } from '../middleware/auth.js';
 import { AppError, asyncHandler, sendData } from '../utils/http.js';
 import { env } from '../config/env.js';
-import { Batch, Exam, RoutineEntry, Section } from '../models/index.js';
+import { Batch, Exam, RoutineEntry, Section, User } from '../models/index.js';
 import { routinePopulate, serializeRoutineEntry } from '../services/routineSerializer.js';
 import { serializeExam } from '../services/routineSerializer.js';
 import { listUpdates } from '../services/updates.js';
@@ -57,7 +57,7 @@ async function buildAssistantContext(user) {
   const ownSectionId = idOf(user.sectionId);
   const examSectionIds = coordinator ? sectionIds : [...new Set([ownSectionId].filter(Boolean))];
 
-  const [routineRows, exams, updates] = await Promise.all([
+  const [routineRows, exams, updates, users] = await Promise.all([
     RoutineEntry.find({ sectionId: { $in: sectionIds } })
       .populate(routinePopulate)
       .sort({ sectionId: 1, day: 1, period: 1 }),
@@ -67,6 +67,9 @@ async function buildAssistantContext(user) {
           .sort({ examDate: 1, startTime: 1 })
       : Promise.resolve([]),
     listUpdates({ page: 1, limit: 100 }, user),
+    User.find({ sectionId: { $in: sectionIds } })
+      .select('roles lastLoginAt isActive sectionId')
+      .lean(),
   ]);
 
   const sectionNameById = new Map(sections.map((section) => [String(section._id), section.name]));
@@ -102,11 +105,14 @@ async function buildAssistantContext(user) {
     conflicts.push(...detectConflicts(ownRoutine, serializedExams));
   }
 
+  const stats = buildUserStats(users, sections, batchNumberById, coordinator);
+
   const text = buildContextText({
     routine,
     updates: updates.items,
     exams: serializedExams,
     conflicts,
+    users: stats.bySection,
     departmentWide: coordinator,
   });
 
@@ -115,11 +121,44 @@ async function buildAssistantContext(user) {
     section: sectionNameById.get(ownSectionId) || null,
     departmentWide: coordinator,
     sectionCount: sections.length,
+    stats,
     routine,
     updates: updates.items,
     exams: serializedExams,
     conflicts,
     text,
+  };
+}
+
+/**
+ * Read-only people stats for the assistant. CRs are counted separately (they
+ * are also students), "loggedIn" counts accounts that have signed in at least
+ * once (lastLoginAt set).
+ */
+function buildUserStats(users, sections, batchNumberById, coordinator) {
+  const bySection = sections.map((section) => {
+    const key = String(section._id);
+    const members = users.filter((u) => String(u.sectionId) === key);
+    const students = members.filter((u) => u.roles?.includes('student'));
+    const crs = members.filter((u) => u.roles?.includes('cr'));
+    const loggedIn = members.filter(
+      (u) => u.lastLoginAt != null && u.roles?.includes('student')
+    );
+    return {
+      sectionId: key,
+      sectionName: section.name,
+      batchNumber: coordinator ? (batchNumberById.get(key) ?? null) : null,
+      students: students.length,
+      cr: crs.length,
+      loggedIn: loggedIn.length,
+    };
+  });
+  return {
+    totalStudents: bySection.reduce((sum, s) => sum + s.students, 0),
+    totalCr: bySection.reduce((sum, s) => sum + s.cr, 0),
+    loggedIn: bySection.reduce((sum, s) => sum + s.loggedIn, 0),
+    totalAccounts: users.length,
+    bySection,
   };
 }
 
@@ -290,6 +329,36 @@ function deterministicReply(message, user, context = null) {
     );
   }
 
+  // People/stats questions: "total student?", "how many students logged in?"
+  const asksPeople =
+    /(how many|total|count|number of|strength|list)/.test(text) &&
+    /(student|user|account|login|logged|sign(ed)? in|people|classmate|cr\b)/.test(text);
+  if (asksPeople && context?.stats) {
+    const stats = context.stats;
+    if (/login|logged|sign(ed)? in/.test(text)) {
+      const lines = stats.bySection.map(
+        (s) =>
+          `- Section ${s.sectionName}${s.batchNumber != null ? ` (batch ${s.batchNumber})` : ''}: **${s.loggedIn} of ${s.students}** logged in`
+      );
+      return [
+        `**${stats.loggedIn} of ${stats.totalStudents}** student accounts have logged in at least once.`,
+        '',
+        ...lines,
+      ].join('\n');
+    }
+    const lines = stats.bySection.map(
+      (s) =>
+        `- Section ${s.sectionName}${s.batchNumber != null ? ` (batch ${s.batchNumber})` : ''}: **${s.students}** ${s.students === 1 ? 'student' : 'students'}${s.cr ? ` (incl. ${s.cr} CR)` : ''}`
+    );
+    return [
+      `There are **${stats.totalStudents} student${stats.totalStudents === 1 ? '' : 's'}**${
+        stats.totalCr ? ` (${stats.totalCr} of them CR${stats.totalCr === 1 ? '' : 's'})` : ''
+      } across ${stats.bySection.length} section${stats.bySection.length === 1 ? '' : 's'}.`,
+      '',
+      ...lines,
+    ].join('\n');
+  }
+
   // Exams — word boundaries so "ct" no longer matches inside words like "conflict".
   if (context?.exams?.length && /\b(exam|exams|test|quiz|ct|midterm|final|assessment)\b/.test(text)) {
     return [
@@ -405,7 +474,7 @@ function deterministicReply(message, user, context = null) {
   ].join('\n');
 }
 
-function buildContextText({ routine, updates, exams, conflicts, departmentWide = false }) {
+function buildContextText({ routine, updates, exams, conflicts, users = [], departmentWide = false }) {
   const sectionLabel = (entry) =>
     `Section ${entry.sectionName}${departmentWide && entry.batchNumber != null ? ` (batch ${entry.batchNumber})` : ''}`;
   const routineText = routine
@@ -424,6 +493,17 @@ function buildContextText({ routine, updates, exams, conflicts, departmentWide =
     )
     .join('\n');
   const conflictsText = conflicts.map((conflict) => conflict.description).join('\n');
+  const usersText = users
+    .map((section) => {
+      const label = `Section ${section.sectionName}${departmentWide && section.batchNumber != null ? ` (batch ${section.batchNumber})` : ''}`;
+      return `${label}: ${section.students} student${section.students === 1 ? '' : 's'}, ${section.cr} CR, ${section.loggedIn} logged in`;
+    })
+    .join('\n');
+  const totals = {
+    students: users.reduce((sum, s) => sum + s.students, 0),
+    crs: users.reduce((sum, s) => sum + s.cr, 0),
+    loggedIn: users.reduce((sum, s) => sum + s.loggedIn, 0),
+  };
   return [
     'ROUTINE:',
     routineText || 'No routine entries found.',
@@ -433,6 +513,9 @@ function buildContextText({ routine, updates, exams, conflicts, departmentWide =
     examsText || 'No exams found.',
     'CONFLICTS:',
     conflictsText || 'No conflicts found.',
+    'STUDENTS:',
+    usersText || 'No student accounts found.',
+    `TOTAL: ${totals.students} students, ${totals.crs} CRs, ${totals.loggedIn} have logged in.`,
   ].join('\n');
 }
 
