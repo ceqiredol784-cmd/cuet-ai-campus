@@ -1,8 +1,8 @@
 import express from 'express';
-import { protect } from '../middleware/auth.js';
+import { isCoordinator, protect } from '../middleware/auth.js';
 import { AppError, asyncHandler, sendData } from '../utils/http.js';
 import { env } from '../config/env.js';
-import { Exam, RoutineEntry, Section } from '../models/index.js';
+import { Batch, Exam, RoutineEntry, Section } from '../models/index.js';
 import { routinePopulate, serializeRoutineEntry } from '../services/routineSerializer.js';
 import { serializeExam } from '../services/routineSerializer.js';
 import { listUpdates } from '../services/updates.js';
@@ -11,46 +11,126 @@ import { idOf } from '../services/access.js';
 const router = express.Router();
 router.use(protect);
 
+/**
+ * AI context scope (read-only). Coordinators see their whole department —
+ * every batch and section; students and CRs see their own batch.
+ */
+async function assistantSectionScope(user) {
+  if (isCoordinator(user)) {
+    const departmentId = idOf(user.departmentId);
+    const ownBatchId = idOf(user.batchId);
+    const batches = departmentId
+      ? await Batch.find({ departmentId }).select('_id batchNumber').lean()
+      : [];
+    const batchIds = [
+      ...new Set([...batches.map((batch) => String(batch._id)), ownBatchId].filter(Boolean)),
+    ];
+    if (batchIds.length === 0) {
+      return { sections: [], batchNumberById: new Map(), batchIds: [] };
+    }
+    const sections = await Section.find({ batchId: { $in: batchIds } })
+      .select('_id name label batchId')
+      .populate('batchId', 'batchNumber')
+      .sort({ batchId: 1, name: 1 });
+    const batchNumberById = new Map(
+      sections.map((section) => [String(section._id), section.batchId?.batchNumber ?? null])
+    );
+    return { sections, batchNumberById, batchIds };
+  }
+
+  const batchId = idOf(user.batchId);
+  if (!batchId) return { sections: [], batchNumberById: new Map(), batchIds: [] };
+  const sections = await Section.find({ batchId }).select('_id name label').sort({ name: 1 });
+  return { sections, batchNumberById: new Map(), batchIds: [batchId] };
+}
+
+/**
+ * Builds the read-only assistant context. The assistant never writes — this
+ * only assembles what it may read for its answers.
+ */
+async function buildAssistantContext(user) {
+  const { sections, batchNumberById } = await assistantSectionScope(user);
+  if (sections.length === 0) return null;
+
+  const coordinator = isCoordinator(user);
+  const sectionIds = sections.map((section) => section._id);
+  const ownSectionId = idOf(user.sectionId);
+  const examSectionIds = coordinator ? sectionIds : [...new Set([ownSectionId].filter(Boolean))];
+
+  const [routineRows, exams, updates] = await Promise.all([
+    RoutineEntry.find({ sectionId: { $in: sectionIds } })
+      .populate(routinePopulate)
+      .sort({ sectionId: 1, day: 1, period: 1 }),
+    examSectionIds.length
+      ? Exam.find({ sectionId: { $in: examSectionIds } })
+          .populate('courseId', 'code title')
+          .sort({ examDate: 1, startTime: 1 })
+      : Promise.resolve([]),
+    listUpdates({ page: 1, limit: 100 }, user),
+  ]);
+
+  const sectionNameById = new Map(sections.map((section) => [String(section._id), section.name]));
+  const routine = routineRows.map((entry) => {
+    const serialized = {
+      ...serializeRoutineEntry(entry),
+      sectionName: sectionNameById.get(String(entry.sectionId)) || '',
+    };
+    const batchNumber = batchNumberById.get(String(entry.sectionId));
+    if (coordinator && batchNumber != null) serialized.batchNumber = batchNumber;
+    return serialized;
+  });
+  const serializedExams = exams.map(serializeExam);
+
+  // Conflicts are per section: two sections sharing a slot is normal in a
+  // department view — only clashes inside one section (or with its exam) count.
+  const conflicts = [];
+  if (coordinator) {
+    const rowsBySection = new Map();
+    for (const entry of routine) {
+      const key = String(entry.sectionId ?? '');
+      if (!rowsBySection.has(key)) rowsBySection.set(key, []);
+      rowsBySection.get(key).push(entry);
+    }
+    for (const [key, rows] of rowsBySection) {
+      const sectionExams = serializedExams.filter(
+        (exam) => String(exam.sectionId?._id ?? exam.sectionId) === key
+      );
+      conflicts.push(...detectConflicts(rows, sectionExams));
+    }
+  } else {
+    const ownRoutine = routine.filter((entry) => String(entry.sectionId) === ownSectionId);
+    conflicts.push(...detectConflicts(ownRoutine, serializedExams));
+  }
+
+  const text = buildContextText({
+    routine,
+    updates: updates.items,
+    exams: serializedExams,
+    conflicts,
+    departmentWide: coordinator,
+  });
+
+  return {
+    batchNumber: user.batchId?.batchNumber ?? null,
+    section: sectionNameById.get(ownSectionId) || null,
+    departmentWide: coordinator,
+    sectionCount: sections.length,
+    routine,
+    updates: updates.items,
+    exams: serializedExams,
+    conflicts,
+    text,
+  };
+}
+
 router.get(
   '/context',
   asyncHandler(async (req, res) => {
-    const sectionId = idOf(req.user.sectionId);
-    const batchId = idOf(req.user.batchId);
-    if (!sectionId || !batchId) {
+    const context = await buildAssistantContext(req.user);
+    if (!context) {
       throw new AppError(400, 'Complete your academic profile to use the campus assistant');
     }
-
-    const sections = await Section.find({ batchId }).select('_id name label').sort({ name: 1 });
-    const sectionIds = sections.map((section) => section._id);
-    const [routineRows, exams, updates] = await Promise.all([
-      RoutineEntry.find({ sectionId: { $in: sectionIds } })
-        .populate(routinePopulate)
-        .sort({ sectionId: 1, day: 1, period: 1 }),
-      Exam.find({ sectionId }).populate('courseId', 'code title').sort({ examDate: 1, startTime: 1 }),
-      listUpdates({ page: 1, limit: 100 }, req.user),
-    ]);
-
-    const sectionNameById = new Map(
-      sections.map((section) => [String(section._id), section.name])
-    );
-    const routine = routineRows.map((entry) => ({
-      ...serializeRoutineEntry(entry),
-      sectionName: sectionNameById.get(String(entry.sectionId)) || '',
-    }));
-    const serializedExams = exams.map(serializeExam);
-    const ownRoutine = routine.filter((entry) => String(entry.sectionId) === sectionId);
-    const conflicts = detectConflicts(ownRoutine, serializedExams);
-    const text = buildContextText({ routine, updates: updates.items, exams: serializedExams, conflicts });
-
-    sendData(res, {
-      batchNumber: req.user.batchId?.batchNumber ?? null,
-      section: sectionNameById.get(sectionId) || null,
-      routine,
-      updates: updates.items,
-      exams: serializedExams,
-      conflicts,
-      text,
-    });
+    sendData(res, context);
   })
 );
 
@@ -64,40 +144,7 @@ router.post(
 
     let context = null;
     try {
-      const sectionId = idOf(req.user.sectionId);
-      if (sectionId) {
-        const sections = await Section.find({ batchId: req.user.batchId }).select('_id name label');
-        const sectionIds = sections.map((section) => section._id);
-        const [routineRows, exams, updates] = await Promise.all([
-          RoutineEntry.find({ sectionId: { $in: sectionIds } })
-            .populate(routinePopulate)
-            .sort({ sectionId: 1, day: 1, period: 1 }),
-          Exam.find({ sectionId }).populate('courseId', 'code title').sort({ examDate: 1, startTime: 1 }),
-          listUpdates({ page: 1, limit: 100 }, req.user),
-        ]);
-        const sectionNameById = new Map(
-          sections.map((section) => [String(section._id), section.name])
-        );
-        const routine = routineRows.map((entry) => ({
-          ...serializeRoutineEntry(entry),
-          sectionName: sectionNameById.get(String(entry.sectionId)) || '',
-        }));
-        const serializedExams = exams.map(serializeExam);
-        const ownRoutine = routine.filter((entry) => String(entry.sectionId) === sectionId);
-        const conflicts = detectConflicts(ownRoutine, serializedExams);
-        context = {
-          text: buildContextText({
-            routine,
-            updates: updates.items,
-            exams: serializedExams,
-            conflicts,
-          }),
-          routine,
-          updates: updates.items,
-          exams: serializedExams,
-          conflicts,
-        };
-      }
+      context = await buildAssistantContext(req.user);
     } catch {
       context = null;
     }
@@ -202,16 +249,49 @@ function nextClassEntry(routine) {
 function deterministicReply(message, user, context = null) {
   const text = String(message || '').toLowerCase();
   const name = user?.name || 'there';
-  if (context?.conflicts?.length && /(conflict|clash|overlap)/.test(text)) {
+
+  // Identity questions first, so they are never swallowed by topic branches.
+  if (/who are you|what are you|your name|introduce yourself|about yourself/.test(text)) {
     return [
-      `I found **${context.conflicts.length} schedule conflict${context.conflicts.length === 1 ? '' : 's'}** in your routine:`,
+      `Hi **${name}**! I'm the **CUET AI Campus assistant** — the built-in helper of this app.`,
       '',
-      ...context.conflicts.map((conflict) => `- ${conflict.description}`),
-      '',
-      'Open **Routine → Conflicts** to review them in detail.',
+      'I answer from your real campus data (read-only). Try asking about:',
+      '- **Routine** — *"Show me my Monday schedule"*',
+      '- **Next class** — *"What is my next class?"*',
+      '- **Exams** — *"When is my next exam?"*',
+      '- **Notices** — *"Any new notices?"*',
+      ...(isCoordinator(user)
+        ? [
+            '',
+            'As a **coordinator**, I can see the schedule and exams of every section and batch in your department.',
+          ]
+        : []),
     ].join('\n');
   }
-  if (context?.exams?.length && /exam|test|ct|midterm|final/.test(text)) {
+
+  // Conflict/problem questions — tolerate common typos ("confict", "conflct").
+  const asksAboutProblems =
+    /(conflic|conflc|confic|clash|overlap|collision)/.test(text) ||
+    (/(routine|schedule|timetable|class(es)?)/.test(text) &&
+      /(problem|issue|wrong|mistake|error|mismatch|confuse)/.test(text));
+  if (asksAboutProblems) {
+    if (context?.conflicts?.length) {
+      return [
+        `I found **${context.conflicts.length} schedule conflict${context.conflicts.length === 1 ? '' : 's'}** in your routine:`,
+        '',
+        ...context.conflicts.map((conflict) => `- ${conflict.description}`),
+        '',
+        'Open **Routine → Conflicts** to review them in detail.',
+      ].join('\n');
+    }
+    return (
+      "I checked your routine — **no schedule conflicts** were found. Classes don't overlap " +
+      'and no exam clashes with a class. Ask me about a specific day for the full timetable.'
+    );
+  }
+
+  // Exams — word boundaries so "ct" no longer matches inside words like "conflict".
+  if (context?.exams?.length && /\b(exam|exams|test|quiz|ct|midterm|final|assessment)\b/.test(text)) {
     return [
       '### Your upcoming exams',
       '',
@@ -325,11 +405,13 @@ function deterministicReply(message, user, context = null) {
   ].join('\n');
 }
 
-function buildContextText({ routine, updates, exams, conflicts }) {
+function buildContextText({ routine, updates, exams, conflicts, departmentWide = false }) {
+  const sectionLabel = (entry) =>
+    `Section ${entry.sectionName}${departmentWide && entry.batchNumber != null ? ` (batch ${entry.batchNumber})` : ''}`;
   const routineText = routine
     .map(
       (entry) =>
-        `Section ${entry.sectionName}: ${entry.day} P${entry.period} ${entry.course?.code || entry.courseId} ${entry.startTime}-${entry.endTime}${entry.room ? ` @${entry.room}` : ''}`
+        `${sectionLabel(entry)}: ${entry.day} P${entry.period} ${entry.course?.code || entry.courseId} ${entry.startTime}-${entry.endTime}${entry.room ? ` @${entry.room}` : ''}`
     )
     .join('\n');
   const noticesText = updates
@@ -425,6 +507,14 @@ async function generateChatReply({ message, history, user, headers, context }) {
     'You are the CUET AI Campus assistant. Answer student questions about their class',
     'schedule, attendance, exams, assignments, and notices using only the context they',
     'provide. Keep replies short and helpful. Batch numbers are numeric cohort codes such as 22, not years.',
+    ...(isCoordinator(user)
+      ? [
+          'You are assisting a department COORDINATOR. The context covers every section and',
+          'batch in their whole department (read-only overview). When answering about a',
+          'section, mention its section name and batch number. You can only read and report',
+          'this data — never claim to have changed or created anything.',
+        ]
+      : []),
     'Formatting rules (follow them exactly):',
     '- Reply in clean Markdown that renders in a chat bubble.',
     '- Start with one short direct answer sentence.',
@@ -432,6 +522,9 @@ async function generateChatReply({ message, history, user, headers, context }) {
     '- When listing classes, exams or notices, prefer a Markdown table',
     '  (columns: Course | Day/Date | Time | Room).',
     '- Keep replies under ~180 words. Never dump raw unstructured text.',
+    'If asked who you are, what your name is, or which model powers you, always answer as',
+    'the CUET AI Campus assistant — the built-in helper of this app that answers from the',
+    'campus data provided. Never reveal or confirm the underlying model or vendor behind you.',
     context?.text || '',
   ].join('\n');
 
