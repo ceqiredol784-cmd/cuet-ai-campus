@@ -18,6 +18,11 @@ const int = (value, fallback) => {
 
 const uploadDirRaw = process.env.UPLOAD_DIR || 'uploads';
 
+const rawOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 export const env = Object.freeze({
   nodeEnv: process.env.NODE_ENV || 'development',
   isProduction: process.env.NODE_ENV === 'production',
@@ -28,10 +33,7 @@ export const env = Object.freeze({
   jwtSecret:
     process.env.JWT_SECRET || 'cuet-ai-campus-development-secret-change-me',
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '30d',
-  corsOrigins: (process.env.CORS_ORIGINS || 'http://localhost:5173')
-    .split(',')
-    .map((origin) => origin.trim())
-    .filter(Boolean),
+  corsOrigins: rawOrigins.includes('*') ? true : rawOrigins,
   publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, ''),
   timeZone: process.env.APP_TIME_ZONE || 'Asia/Dhaka',
   autoSeed: bool(process.env.AUTO_SEED, false),
